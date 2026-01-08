@@ -39,11 +39,11 @@ class ServerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INFEMERAL_SERVER_")
 
     weights_path: str = Field(
-        default="/runpod-volume/server_weights.tensors",
+        default="/workspace/server_weights.safetensors",
         description="Path to tensorized server weights",
     )
     kv_cache_dir: str = Field(
-        default="/runpod-volume/kv",
+        default="/workspace/kv",
         description="Directory for encrypted KV cache storage",
     )
     max_context_length: int = Field(default=2048, description="Maximum context length")

@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 from safetensors.torch import load_file
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AwqConfig
 
 from infemeral.config import server_settings
 from infemeral.crypto import decrypt_bytes, encrypt_bytes
@@ -107,18 +107,32 @@ def load_model(weights_path: str, device: str | None = None) -> torch.nn.Module:
 
     # Fallback to safetensors
     if _model is None:
-        config_path = Path(weights_path).parent
-        _config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        weights_dir = Path(weights_path).parent
 
-        # Load model without weights first
-        _model = AutoModelForCausalLM.from_config(_config, torch_dtype=torch.float16)
+        # Check if this is an AWQ model by looking at config
+        _config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
+        is_awq = hasattr(_config, 'quantization_config') or 'awq' in str(weights_dir).lower()
 
-        # Load server weights (transformer layers only)
-        state_dict = load_file(weights_path)
-        missing, unexpected = _model.load_state_dict(state_dict, strict=False)
-        print(f"Loaded weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        if is_awq:
+            # Load AWQ model directly - it handles quantized weights
+            print(f"Loading AWQ model from {weights_dir}...")
+            _model = AutoModelForCausalLM.from_pretrained(
+                weights_dir,
+                torch_dtype=torch.float16,
+                device_map=device,
+                trust_remote_code=True,
+            )
+            print(f"AWQ model loaded successfully")
+        else:
+            # Standard model: load config, create shell, load weights
+            _model = AutoModelForCausalLM.from_config(_config, torch_dtype=torch.float16)
+            state_dict = load_file(weights_path)
+            missing, unexpected = _model.load_state_dict(state_dict, strict=False)
+            print(f"Loaded weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
-    _model = _model.to(device)
+    # Only move to device if not already placed by device_map
+    if not hasattr(_model, 'hf_device_map'):
+        _model = _model.to(device)
     _model.eval()
     print(f"Model loaded. Hidden size: {_config.hidden_size}")
 
@@ -233,6 +247,8 @@ def forward_transformer(
     for i, layer in enumerate(layers):
         past_kv = past_key_values[i] if past_key_values else None
 
+        # Don't pass position_embeddings - let the layer compute them internally
+        # from position_ids
         layer_outputs = layer(
             hidden_states,
             attention_mask=attention_mask,
@@ -242,12 +258,13 @@ def forward_transformer(
         )
 
         hidden_states = layer_outputs[0]
-        new_key_values.append(layer_outputs[1])
+        if len(layer_outputs) > 1 and layer_outputs[1] is not None:
+            new_key_values.append(layer_outputs[1])
 
     # Final layer norm
     hidden_states = norm(hidden_states)
 
-    return hidden_states, tuple(new_key_values)
+    return hidden_states, tuple(new_key_values) if new_key_values else ()
 
 
 def handler(event: dict) -> dict:
