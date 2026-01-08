@@ -1,0 +1,62 @@
+[project]
+name = "infemeral"
+version = "0.1.0"
+description = "Zero-trust distributed LLM inference"
+requires-python = ">=3.11"
+dependencies = [
+    # ML/Inference
+    "torch>=2.4.0",
+    "transformers>=4.44.0",
+    "safetensors>=0.4.0",
+    "vllm>=0.6.0",
+    "tensorizer>=2.9.0",
+
+    # Crypto
+    "cryptography>=42.0.0",
+    "scipy>=1.14.0",
+
+    # gRPC
+    "grpcio>=1.66.0",
+    "grpcio-tools>=1.66.0",
+    "protobuf>=5.27.0",
+
+    # Config
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+
+    # RunPod
+    "runpod>=1.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "-ra",
+]
+markers = [
+    "slow: marks tests as slow",
+    "gpu: marks tests that require GPU",
+    "integration: marks integration tests",
+]

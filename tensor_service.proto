@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package infemeral;
+
+// Request to run inference on cloaked embeddings
+message InferenceRequest {
+    bytes cloaked_embedding = 1;       // Serialized cloaked tensor
+    bytes encrypted_session_key = 2;   // RSA-OAEP wrapped AES-256 key
+    bytes nonce = 3;                   // AES-GCM nonce (12 bytes)
+    repeated int64 shape = 4;          // Tensor shape [batch, seq_len, hidden_dim]
+    string dtype = 5;                  // Tensor dtype (e.g., "float16")
+    string session_id = 6;             // Session identifier for KV cache
+    int32 max_new_tokens = 7;          // Max tokens to generate (default: 1)
+    float temperature = 8;             // Sampling temperature
+}
+
+// Response containing transformed hidden states
+message InferenceResponse {
+    bytes output = 1;                  // Serialized output tensor
+    repeated int64 shape = 2;          // Output tensor shape
+    string dtype = 3;                  // Output dtype
+    int32 tokens_processed = 4;        // Number of tokens processed
+    string error = 5;                  // Error message if any
+}
+
+// Service definition
+service TensorInference {
+    // Single inference call
+    rpc Infer(InferenceRequest) returns (InferenceResponse);
+}

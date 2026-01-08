@@ -1,0 +1,10 @@
+{
+  "input": {
+    "cloaked_embedding": "AAAAAAAAAAAAAAAAAAAAAA==",
+    "encrypted_session_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "nonce": "AAAAAAAAAAAAAAAAAA==",
+    "shape": [1, 1, 4096],
+    "dtype": "float32",
+    "session_id": "test-session-001"
+  }
+}
