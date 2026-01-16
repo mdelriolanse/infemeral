@@ -94,7 +94,8 @@ class Client:
         if tokenizer_path and Path(tokenizer_path).exists():
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(client_settings.model_id)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                client_settings.model_id)
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -106,7 +107,8 @@ class Client:
         # Session state
         self.session_id = secrets.token_hex(16)
         self.session_key = generate_session_key()
-        self.cloaking_ctx = create_cloaking_context(seed=secrets.randbelow(2**31))
+        self.cloaking_ctx = create_cloaking_context(
+            seed=secrets.randbelow(2**31))
 
         # gRPC channel (lazy init)
         self._channel: grpc.Channel | None = None
@@ -130,7 +132,8 @@ class Client:
                     ("grpc.max_receive_message_length", 100 * 1024 * 1024),
                 ],
             )
-            self._stub = tensor_service_pb2_grpc.TensorInferenceStub(self._channel)
+            self._stub = tensor_service_pb2_grpc.TensorInferenceStub(
+                self._channel)
         return self._stub
 
     def _call_server(self, cloaked: torch.Tensor) -> torch.Tensor:
@@ -186,7 +189,8 @@ class Client:
             Generated text including the prompt
         """
         # Tokenize (client-only operation)
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        input_ids = self.tokenizer.encode(
+            prompt, return_tensors="pt").to(self.device)
         generated_ids = input_ids.clone()
 
         for _ in range(max_new_tokens):
@@ -213,7 +217,8 @@ class Client:
                 break
 
             # Append to sequence
-            generated_ids = torch.cat([generated_ids, next_token.unsqueeze(0)], dim=1)
+            generated_ids = torch.cat(
+                [generated_ids, next_token.unsqueeze(0)], dim=1)
 
         return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 
@@ -232,11 +237,13 @@ class Client:
 
         # Top-p (nucleus) sampling
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        cumulative_probs = torch.cumsum(
+            F.softmax(sorted_logits, dim=-1), dim=-1)
 
         # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[...,
+                                 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
         indices_to_remove = sorted_indices_to_remove.scatter(
@@ -261,7 +268,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Infemeral client")
-    parser.add_argument("--weights", default="./weights/client_weights.safetensors")
+    parser.add_argument(
+        "--weights", default="./weights/client_weights.safetensors")
     parser.add_argument("--server", default="localhost:50051")
     parser.add_argument("--prompt", default="Hello, how are you?")
     parser.add_argument("--max-tokens", type=int, default=50)
