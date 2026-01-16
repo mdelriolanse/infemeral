@@ -6,6 +6,17 @@ from typing import Literal
 import numpy as np
 import torch
 
+# LZ4 compression (optional, graceful fallback if not installed)
+try:
+    import lz4.frame as lz4_frame
+    HAS_LZ4 = True
+except ImportError:
+    lz4_frame = None
+    HAS_LZ4 = False
+
+# Minimum payload size (bytes) to apply compression
+LZ4_COMPRESSION_THRESHOLD = 4096
+
 # Supported dtypes for serialization
 DTYPE_MAP: dict[str, np.dtype] = {
     "float16": np.float16,
@@ -266,3 +277,63 @@ def unpack_kv_cache(
     ).to(device)
 
     return keys, values
+
+
+def compress_tensor_data(data: bytes) -> bytes:
+    """Compress tensor data using LZ4 if beneficial.
+
+    Only compresses if:
+    1. LZ4 is available
+    2. Data size exceeds threshold (4KB)
+
+    Format:
+    - Uncompressed: raw data (no header)
+    - Compressed: 0x4C (L) + 0x34 (4) + compressed_data
+
+    Args:
+        data: Raw tensor bytes
+
+    Returns:
+        Compressed bytes (or original if compression not beneficial)
+    """
+    if not HAS_LZ4 or len(data) < LZ4_COMPRESSION_THRESHOLD:
+        return data
+
+    compressed = lz4_frame.compress(data)
+
+    # Only use compression if it actually reduces size
+    if len(compressed) + 2 < len(data):
+        return b"L4" + compressed
+
+    return data
+
+
+def decompress_tensor_data(data: bytes) -> bytes:
+    """Decompress tensor data if LZ4-compressed.
+
+    Detects compression by checking for "L4" header.
+
+    Args:
+        data: Potentially compressed bytes
+
+    Returns:
+        Decompressed bytes
+    """
+    if len(data) < 2:
+        return data
+
+    # Check for LZ4 header
+    if data[:2] == b"L4":
+        if not HAS_LZ4:
+            raise ImportError(
+                "Received LZ4-compressed data but lz4 package not installed. "
+                "Install with: pip install lz4"
+            )
+        return lz4_frame.decompress(data[2:])
+
+    return data
+
+
+def is_lz4_available() -> bool:
+    """Check if LZ4 compression is available."""
+    return HAS_LZ4

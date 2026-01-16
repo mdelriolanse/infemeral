@@ -23,6 +23,8 @@ class CloakingContext:
     matrix: torch.Tensor  # Orthogonal matrix M (d x d)
     matrix_t: torch.Tensor  # Transposed M for uncloaking
     sigma: float  # DP noise standard deviation
+    device: str = "cpu"  # Device where matrix is stored
+    seed: int | None = None  # Seed for lazy regeneration
 
 
 def generate_orthogonal_matrix(dim: int, seed: int | None = None) -> np.ndarray:
@@ -71,21 +73,40 @@ def compute_dp_sigma(epsilon: float, delta: float, sensitivity: float = 1.0) -> 
     return sensitivity * np.sqrt(2 * np.log(1.25 / delta)) / epsilon
 
 
-def create_cloaking_context(seed: int | None = None) -> CloakingContext:
+def create_cloaking_context(
+    seed: int | None = None,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float16,
+) -> CloakingContext:
     """Create a new cloaking context for a session.
 
     Args:
         seed: Random seed for orthogonal matrix (should be unique per session)
+        device: Target device for matrix storage (cpu or cuda)
+        dtype: Storage dtype (float16 saves 50% memory, float32 for max precision)
 
     Returns:
-        CloakingContext with matrix and DP parameters
+        CloakingContext with matrix and DP parameters on the specified device
     """
     dim = crypto_settings.hidden_dim
+
+    # Generate in float32 for numerical stability during QR decomposition
     matrix_np = generate_orthogonal_matrix(dim, seed)
     matrix = torch.from_numpy(matrix_np)
+
+    # Convert to target dtype and device
+    matrix = matrix.to(device=device, dtype=dtype)
+    matrix_t = matrix.T.contiguous()
+
     sigma = compute_dp_sigma(crypto_settings.dp_epsilon, crypto_settings.dp_delta)
 
-    return CloakingContext(matrix=matrix, matrix_t=matrix.T, sigma=sigma)
+    return CloakingContext(
+        matrix=matrix,
+        matrix_t=matrix_t,
+        sigma=sigma,
+        device=device,
+        seed=seed,
+    )
 
 
 def cloak(
@@ -104,8 +125,13 @@ def cloak(
         Cloaked tensor of same shape and dtype
     """
     device = hidden.device
-    original_dtype = hidden.dtype
-    matrix = ctx.matrix.to(device=device, dtype=hidden.dtype)
+    compute_dtype = hidden.dtype
+
+    # Avoid .to() call if matrix is already on correct device and dtype
+    matrix = ctx.matrix
+    needs_transfer = matrix.device != device or matrix.dtype != compute_dtype
+    if needs_transfer:
+        matrix = matrix.to(device=device, dtype=compute_dtype)
 
     if add_noise:
         noise = torch.randn_like(hidden) * ctx.sigma
@@ -129,7 +155,13 @@ def uncloak(cloaked: torch.Tensor, ctx: CloakingContext) -> torch.Tensor:
         Uncloaked tensor of same shape and dtype
     """
     device = cloaked.device
-    matrix_t = ctx.matrix_t.to(device=device, dtype=cloaked.dtype)
+    compute_dtype = cloaked.dtype
+
+    # Avoid .to() call if matrix is already on correct device and dtype
+    matrix_t = ctx.matrix_t
+    needs_transfer = matrix_t.device != device or matrix_t.dtype != compute_dtype
+    if needs_transfer:
+        matrix_t = matrix_t.to(device=device, dtype=compute_dtype)
 
     # Apply inverse rotation: x = x' @ M (since M.T @ M = I)
     return torch.einsum("ij,...j->...i", matrix_t, cloaked)

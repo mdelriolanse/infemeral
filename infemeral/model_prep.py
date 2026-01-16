@@ -83,28 +83,45 @@ def extract_client_weights(
     # Extract client components (embedding + lm_head)
     print("Extracting client components (embed_tokens + lm_head)...")
     client_state_dict = {}
+    metadata = {}
 
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         # Llama-style architecture
-        client_state_dict["embed_tokens.weight"] = (
-            model.model.embed_tokens.weight.data.clone().cpu()
-        )
-        print(f"  embed_tokens.weight: {client_state_dict['embed_tokens.weight'].shape}")
+        # Convert to float16 for smaller file size (sufficient precision for embeddings)
+        embed_weight = model.model.embed_tokens.weight.data.clone().cpu().half()
+        client_state_dict["embed_tokens.weight"] = embed_weight
+        print(f"  embed_tokens.weight: {embed_weight.shape} (float16)")
     else:
         raise ValueError("Could not find embed_tokens in model")
 
     if hasattr(model, "lm_head"):
-        client_state_dict["lm_head.weight"] = (
-            model.lm_head.weight.data.clone().cpu()
+        lm_head_weight = model.lm_head.weight.data.clone().cpu().half()
+
+        # Check for tied embeddings (many models share embed_tokens and lm_head)
+        # Compare in float32 for accuracy, then save in float16
+        is_tied = torch.equal(
+            model.model.embed_tokens.weight.data,
+            model.lm_head.weight.data,
         )
-        print(f"  lm_head.weight: {client_state_dict['lm_head.weight'].shape}")
+
+        if is_tied:
+            print("  Detected TIED EMBEDDINGS - skipping duplicate lm_head.weight")
+            print(f"  Memory saved: {lm_head_weight.numel() * 2 / 1e6:.1f} MB")
+            metadata["tied_embeddings"] = "true"
+        else:
+            client_state_dict["lm_head.weight"] = lm_head_weight
+            print(f"  lm_head.weight: {lm_head_weight.shape} (float16)")
+            metadata["tied_embeddings"] = "false"
     else:
         raise ValueError("Could not find lm_head in model")
 
-    # Save client weights
+    # Save client weights with metadata
+    metadata["dtype"] = "float16"
     client_path = output_path / "client_weights.safetensors"
-    save_file(client_state_dict, client_path)
+    save_file(client_state_dict, client_path, metadata=metadata)
     print(f"Saved client weights to {client_path}")
+    if metadata.get("tied_embeddings") == "true":
+        print(f"  Metadata: tied_embeddings=true, dtype=float16")
 
     # Save tokenizer for client use
     print("Saving tokenizer...")

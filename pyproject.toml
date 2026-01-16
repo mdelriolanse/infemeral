@@ -16,6 +16,9 @@ dependencies = [
     "cryptography>=42.0.0",
     "scipy>=1.14.0",
 
+    # Compression
+    "lz4>=4.3.0",
+
     # gRPC
     "grpcio>=1.66.0",
     "grpcio-tools>=1.66.0",
