@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import tensor_service_pb2 as tensor__service__pb2
+from infemeral import tensor_service_pb2 as tensor__service__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__

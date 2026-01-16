@@ -3,16 +3,18 @@
 The server processes cloaked embeddings through transformer layers,
 never seeing raw tokens or being able to reconstruct user intent.
 
-Uses vLLM with AWQ quantization for efficient 4-bit inference.
+Uses Tensorizer for fast model loading with AWQ quantization support.
 """
 
-import os
+import logging
+import signal
+from concurrent import futures
 from pathlib import Path
 from typing import Any
 
+import grpc
 import torch
-from safetensors.torch import load_file
-from transformers import AutoConfig, AutoModelForCausalLM, AwqConfig
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from infemeral.config import server_settings
 from infemeral.crypto import decrypt_bytes, encrypt_bytes
@@ -23,46 +25,29 @@ from infemeral.tensors import (
     unpack_kv_cache,
 )
 
+# Import gRPC stubs - handle both installed and development import paths
+try:
+    from infemeral import tensor_service_pb2, tensor_service_pb2_grpc
+except ImportError:
+    import tensor_service_pb2
+    import tensor_service_pb2_grpc
+
+logger = logging.getLogger(__name__)
+
 # Global model instance (persists across serverless invocations)
 _model = None
 _config = None
-_vllm_engine = None
 
 
-def load_model_vllm(model_id: str = "TheBloke/LLaMA-Pro-8B-AWQ"):
-    """Load model using vLLM with AWQ 4-bit quantization.
+def load_model(device: str | None = None) -> torch.nn.Module:
+    """Load transformer model using Tensorizer (preferred) or from_pretrained.
 
-    This is the preferred method for AWQ models as vLLM handles
-    the quantized weights natively with optimized kernels.
-    """
-    global _vllm_engine
+    Priority:
+    1. Tensorizer from server_settings.tensorized_weights_path - fastest loading
+    2. AutoModelForCausalLM.from_pretrained() from server_settings.weights_dir
 
-    if _vllm_engine is not None:
-        return _vllm_engine
-
-    try:
-        from vllm import LLM
-
-        print(f"Loading {model_id} with vLLM (AWQ quantization)...")
-        _vllm_engine = LLM(
-            model=model_id,
-            quantization="awq",
-            dtype="float16",
-            gpu_memory_utilization=0.85,
-            trust_remote_code=True,
-        )
-        print("vLLM engine loaded successfully")
-        return _vllm_engine
-
-    except ImportError:
-        print("vLLM not available, falling back to transformers")
-        return None
-
-
-def load_model(weights_path: str, device: str | None = None) -> torch.nn.Module:
-    """Load transformer model from weights.
-
-    Tries vLLM first for AWQ models, falls back to transformers.
+    Args:
+        device: Device to load model on
     """
     global _model, _config
 
@@ -72,63 +57,59 @@ def load_model(weights_path: str, device: str | None = None) -> torch.nn.Module:
     if _model is not None:
         return _model
 
-    # For AWQ models, prefer vLLM
-    if "AWQ" in server_settings.weights_path or "awq" in server_settings.weights_path:
-        vllm_engine = load_model_vllm()
-        if vllm_engine is not None:
-            # vLLM handles the model internally
-            # Return a wrapper that exposes the model for our forward_transformer
-            _model = vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-            _config = AutoConfig.from_pretrained(
-                "TheBloke/LLaMA-Pro-8B-AWQ", trust_remote_code=True
-            )
-            return _model
+    tensorized_path = Path(server_settings.tensorized_weights_path)
+    weights_dir = Path(server_settings.weights_dir)
 
-    print(f"Loading model from {weights_path}...")
+    print(f"Tensorized path: {tensorized_path}")
+    print(f"Weights directory: {weights_dir}")
 
-    # Try tensorizer first for fast loading
-    if weights_path.endswith(".tensors"):
+    # Try Tensorizer first (preferred for fast cold starts)
+    if tensorized_path.exists():
         try:
             from tensorizer import TensorDeserializer
 
-            print("Using Tensorizer for fast model loading...")
-            deserializer = TensorDeserializer(weights_path, device=device)
-            _config = AutoConfig.from_pretrained(
-                Path(weights_path).parent, trust_remote_code=True
-            )
-            _model = AutoModelForCausalLM.from_config(
-                _config, torch_dtype=torch.float16
-            )
+            print(f"Using Tensorizer for fast model loading from {tensorized_path}...")
+            deserializer = TensorDeserializer(str(tensorized_path), device=device)
+
+            # Load config
+            try:
+                _config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
+            except Exception:
+                _config = AutoConfig.from_pretrained(
+                    server_settings.model_id, trust_remote_code=True
+                )
+
+            _model = AutoModelForCausalLM.from_config(_config, torch_dtype=torch.float16)
             deserializer.load_into_module(_model)
             deserializer.close()
+            print("Model loaded successfully with Tensorizer")
+
         except ImportError:
-            print("Tensorizer not available, falling back to safetensors")
-            weights_path = weights_path.replace(".tensors", ".safetensors")
+            print("Tensorizer not installed, falling back to from_pretrained")
+        except Exception as e:
+            print(f"Tensorizer loading failed: {e}, falling back to from_pretrained")
 
-    # Fallback to safetensors
+    # Fallback: load directly from weights directory
     if _model is None:
-        weights_dir = Path(weights_path).parent
-
-        # Check if this is an AWQ model by looking at config
-        _config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
-        is_awq = hasattr(_config, 'quantization_config') or 'awq' in str(weights_dir).lower()
-
-        if is_awq:
-            # Load AWQ model directly - it handles quantized weights
-            print(f"Loading AWQ model from {weights_dir}...")
-            _model = AutoModelForCausalLM.from_pretrained(
-                weights_dir,
-                torch_dtype=torch.float16,
-                device_map=device,
-                trust_remote_code=True,
+        if not weights_dir.exists():
+            raise FileNotFoundError(
+                f"Model weights directory not found: {weights_dir}\n"
+                f"Run 'python -m infemeral.model_prep' to download and prepare the model."
             )
-            print(f"AWQ model loaded successfully")
-        else:
-            # Standard model: load config, create shell, load weights
-            _model = AutoModelForCausalLM.from_config(_config, torch_dtype=torch.float16)
-            state_dict = load_file(weights_path)
-            missing, unexpected = _model.load_state_dict(state_dict, strict=False)
-            print(f"Loaded weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+
+        print(f"Loading model from {weights_dir} using from_pretrained...")
+
+        # Load config
+        _config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
+
+        # Load model (handles AWQ automatically)
+        _model = AutoModelForCausalLM.from_pretrained(
+            weights_dir,
+            torch_dtype=torch.float16,
+            device_map=device,
+            trust_remote_code=True,
+        )
+        print("Model loaded successfully")
 
     # Only move to device if not already placed by device_map
     if not hasattr(_model, 'hf_device_map'):
@@ -206,6 +187,60 @@ def delete_kv_cache(session_id: str) -> None:
         cache_path.unlink()
 
 
+def _detect_actual_head_dim(
+    attention_layer: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    config: Any | None = None,
+) -> int:
+    """Get head_dim from layer attributes or config.
+
+    For AWQ models, we don't adjust head_dim - the query tensor shape
+    matches the reported head_dim. The issue is elsewhere.
+
+    Args:
+        attention_layer: The attention layer (e.g., layers[0].self_attn)
+        hidden_states: Sample hidden states tensor [batch, seq_len, hidden_dim]
+        config: Model config (optional, for getting num_heads)
+
+    Returns:
+        Head_dim from layer attributes or config
+    """
+    # Get reported head_dim
+    reported_head_dim = getattr(attention_layer, "head_dim", None)
+    if reported_head_dim is None and config is not None:
+        reported_head_dim = config.hidden_size // getattr(
+            config, "num_attention_heads", 32
+        )
+
+    if reported_head_dim is not None:
+        return reported_head_dim
+
+    # Last resort fallback
+    return 128
+
+
+def _create_rotary_embeddings_with_correct_dim(
+    rotary_emb: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create rotary embeddings with correct head_dim.
+
+    Args:
+        rotary_emb: Rotary embedding module
+        hidden_states: Hidden states tensor
+        position_ids: Position IDs tensor
+        head_dim: The head dimension (from layer attributes/config)
+
+    Returns:
+        Tuple of (cos, sin) tensors with correct dimensions
+    """
+    # Compute rotary embeddings and return as-is
+    cos, sin = rotary_emb(hidden_states, position_ids)
+    return cos, sin
+
+
 def forward_transformer(
     model: torch.nn.Module,
     hidden_states: torch.Tensor,
@@ -215,6 +250,9 @@ def forward_transformer(
 
     This bypasses the embedding layer and directly feeds
     hidden states into the transformer blocks.
+
+    Handles both standard and AWQ quantized models by computing
+    position embeddings per-layer using each layer's rotary_emb module.
     """
     # Get the transformer layers
     if hasattr(model, "model"):
@@ -241,23 +279,41 @@ def forward_transformer(
     else:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
-    # Forward through each transformer layer
     new_key_values = []
 
     for i, layer in enumerate(layers):
         past_kv = past_key_values[i] if past_key_values else None
 
-        # Don't pass position_embeddings - let the layer compute them internally
-        # from position_ids
+        layer_attn = layer.self_attn
+
+        # Get rotary embedding module (try layer-specific first, then global)
+        layer_rotary_emb = getattr(layer_attn, "rotary_emb", None)
+        if layer_rotary_emb is None:
+            layer_rotary_emb = getattr(transformer, "rotary_emb", None)
+
+        if layer_rotary_emb is None:
+            raise ValueError(f"Layer {i} has no rotary_emb - cannot compute position_embeddings")
+
+        # Compute rotary embeddings
+        cos, sin = layer_rotary_emb(hidden_states, position_ids)
+        layer_position_embeddings = (cos, sin)
+
         layer_outputs = layer(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_kv,
             use_cache=True,
+            position_embeddings=layer_position_embeddings,
         )
 
         hidden_states = layer_outputs[0]
+
+        # Ensure hidden_states maintains 3D shape [batch, seq_len, hidden_dim]
+        # Some layer implementations squeeze the seq_len dimension when seq_len=1
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)
+
         if len(layer_outputs) > 1 and layer_outputs[1] is not None:
             new_key_values.append(layer_outputs[1])
 
@@ -265,6 +321,141 @@ def forward_transformer(
     hidden_states = norm(hidden_states)
 
     return hidden_states, tuple(new_key_values) if new_key_values else ()
+
+
+class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
+    """gRPC servicer for tensor inference requests."""
+
+    def __init__(self, model: torch.nn.Module, device: str = "cuda"):
+        self.model = model
+        self.device = device
+
+    def Infer(  # noqa: N802 (gRPC method name convention)
+        self, request: tensor_service_pb2.InferenceRequest, context: grpc.ServicerContext
+    ) -> tensor_service_pb2.InferenceResponse:
+        """Process a single inference request.
+
+        Args:
+            request: InferenceRequest with cloaked embedding and session data
+            context: gRPC context for setting status codes
+
+        Returns:
+            InferenceResponse with encrypted output tensor
+        """
+        try:
+            # Extract fields from request
+            session_key = bytes(request.encrypted_session_key)
+            nonce = bytes(request.nonce)
+            cloaked_data = bytes(request.cloaked_embedding)
+            shape = list(request.shape)
+            dtype = request.dtype
+            session_id = request.session_id
+
+            logger.info(f"Processing inference request for session {session_id[:8]}...")
+
+            # Decrypt cloaked embedding
+            plaintext = decrypt_bytes(cloaked_data, session_key, nonce)
+
+            # Deserialize tensor
+            cloaked = deserialize_tensor(plaintext, shape, dtype, device=self.device)
+
+            # Load KV cache if exists
+            kv_cache = load_kv_cache(session_id, session_key, self.device)
+            past_key_values = None
+            if kv_cache is not None:
+                # TODO: Convert to proper past_key_values format
+                pass
+
+            # Forward through transformer
+            with torch.no_grad():
+                output, new_kv = forward_transformer(self.model, cloaked, past_key_values)
+
+            # Save updated KV cache (deferred to Phase 2)
+            # save_kv_cache(session_id, new_kv[0], new_kv[1], session_key)
+
+            # Serialize output
+            output_data, output_shape, output_dtype = serialize_tensor(output)
+
+            # Encrypt output
+            encrypted_output, output_nonce = encrypt_bytes(output_data, session_key)
+
+            # Memory wipe
+            del cloaked, output, kv_cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            logger.info(f"Inference complete for session {session_id[:8]}")
+
+            # Build response with nonce prepended to output (client expects this format)
+            return tensor_service_pb2.InferenceResponse(
+                output=output_nonce + encrypted_output,
+                shape=output_shape,
+                dtype=output_dtype,
+                tokens_processed=shape[1],
+            )
+
+        except Exception as e:
+            error_msg = str(e) or type(e).__name__
+            logger.exception(f"Inference failed: {error_msg}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(error_msg)
+            return tensor_service_pb2.InferenceResponse(error=error_msg)
+
+
+def serve_grpc(port: int | None = None, max_workers: int = 4) -> None:
+    """Start the gRPC inference server.
+
+    Args:
+        port: Port to bind to (defaults to server_settings.grpc_port)
+        max_workers: Maximum number of worker threads
+    """
+    if port is None:
+        port = server_settings.grpc_port
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    logger.info("Loading model...")
+    model = load_model()
+    device = next(model.parameters()).device
+    logger.info(f"Model loaded on {device}")
+
+    # Create gRPC server with large message options (100MB)
+    options = [
+        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+    ]
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers), options=options)
+
+    # Register servicer
+    servicer = TensorInferenceServicer(model, device=str(device))
+    tensor_service_pb2_grpc.add_TensorInferenceServicer_to_server(servicer, server)
+
+    # Bind to port
+    server.add_insecure_port(f"[::]:{port}")
+
+    # Graceful shutdown handling
+    shutdown_event = futures.Future()
+
+    def handle_signal(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down...")
+        shutdown_event.set_result(True)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    # Start server
+    server.start()
+    logger.info(f"gRPC server started on port {port}")
+
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, shutting down...")
+        server.stop(grace=5)
 
 
 def handler(event: dict) -> dict:
@@ -296,7 +487,9 @@ def handler(event: dict) -> dict:
         inp = event.get("input", event)
 
         # Load model on first request (cold start)
-        model = load_model(server_settings.weights_path)
+        # load_model will use server_settings.tensorized_weights_path first,
+        # then fall back to server_settings.weights_path if needed
+        model = load_model()
         device = next(model.parameters()).device
 
         # Decrypt input tensor
@@ -367,8 +560,25 @@ def handler(event: dict) -> dict:
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
-# RunPod entry point
+# Entry point: supports both gRPC server and RunPod serverless modes
 if __name__ == "__main__":
-    import runpod
+    import argparse
 
-    runpod.serverless.start({"handler": handler})
+    parser = argparse.ArgumentParser(description="Infemeral inference server")
+    parser.add_argument(
+        "--mode",
+        choices=["grpc", "runpod"],
+        default="grpc",
+        help="Server mode: 'grpc' for standalone gRPC server, 'runpod' for serverless",
+    )
+    parser.add_argument("--port", type=int, default=None, help="gRPC port (default: 50051)")
+    parser.add_argument("--workers", type=int, default=4, help="Number of worker threads")
+
+    args = parser.parse_args()
+
+    if args.mode == "grpc":
+        serve_grpc(port=args.port, max_workers=args.workers)
+    else:
+        import runpod
+
+        runpod.serverless.start({"handler": handler})
