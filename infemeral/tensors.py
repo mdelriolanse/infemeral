@@ -106,19 +106,139 @@ def pack_kv_cache(
     return header + key_data + val_data
 
 
-def unpack_kv_cache(
-    data: bytes,
-    device: str = "cuda",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Unpack KV cache from byte buffer.
+def pack_kv_cache_v2(
+    kv_tuples: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+) -> bytes:
+    """Pack per-layer KV cache into versioned byte buffer.
+
+    Format:
+        - 1 byte: version (0x02)
+        - 4 bytes: num_layers (uint32)
+        For each layer:
+            - 4 bytes: key data length (uint32)
+            - 4 bytes: num dimensions (uint32)
+            - 8 bytes * ndim: shape (int64 each)
+            - key_len bytes: key data
+            - 4 bytes: value data length (uint32)
+            - 4 bytes: num dimensions (uint32)
+            - 8 bytes * ndim: shape (int64 each)
+            - val_len bytes: value data
 
     Args:
-        data: Packed bytes from pack_kv_cache
+        kv_tuples: Tuple of (key, value) pairs for each layer
+
+    Returns:
+        Packed bytes with version header
+    """
+    # Version header
+    buffer = struct.pack("<B", 0x02)  # Version 2
+    buffer += struct.pack("<I", len(kv_tuples))  # Number of layers
+
+    for keys, values in kv_tuples:
+        # Pack keys
+        key_data = keys.detach().cpu().to(torch.float16).numpy().tobytes()
+        key_shape = keys.shape
+        buffer += struct.pack("<I", len(key_data))
+        buffer += struct.pack("<I", len(key_shape))
+        for dim in key_shape:
+            buffer += struct.pack("<q", dim)
+        buffer += key_data
+
+        # Pack values
+        val_data = values.detach().cpu().to(torch.float16).numpy().tobytes()
+        val_shape = values.shape
+        buffer += struct.pack("<I", len(val_data))
+        buffer += struct.pack("<I", len(val_shape))
+        for dim in val_shape:
+            buffer += struct.pack("<q", dim)
+        buffer += val_data
+
+    return buffer
+
+
+def unpack_kv_cache_v2(
+    data: bytes,
+    device: str = "cuda",
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Unpack per-layer KV cache from versioned byte buffer.
+
+    Args:
+        data: Packed bytes from pack_kv_cache_v2
         device: Target device
 
     Returns:
-        Tuple of (keys, values) tensors
+        Tuple of (key, value) pairs for each layer
     """
+    pos = 0
+
+    # Read version
+    version = struct.unpack("<B", data[pos : pos + 1])[0]
+    pos += 1
+    if version != 0x02:
+        raise ValueError(f"Expected version 0x02, got {version:#04x}")
+
+    # Read number of layers
+    num_layers = struct.unpack("<I", data[pos : pos + 4])[0]
+    pos += 4
+
+    layers = []
+    for _ in range(num_layers):
+        # Unpack key
+        key_len = struct.unpack("<I", data[pos : pos + 4])[0]
+        pos += 4
+        key_ndim = struct.unpack("<I", data[pos : pos + 4])[0]
+        pos += 4
+        key_shape = []
+        for _ in range(key_ndim):
+            key_shape.append(struct.unpack("<q", data[pos : pos + 8])[0])
+            pos += 8
+        key_data = data[pos : pos + key_len]
+        pos += key_len
+        keys = torch.from_numpy(
+            np.frombuffer(key_data, dtype=np.float16).reshape(key_shape).copy()
+        ).to(device)
+
+        # Unpack value
+        val_len = struct.unpack("<I", data[pos : pos + 4])[0]
+        pos += 4
+        val_ndim = struct.unpack("<I", data[pos : pos + 4])[0]
+        pos += 4
+        val_shape = []
+        for _ in range(val_ndim):
+            val_shape.append(struct.unpack("<q", data[pos : pos + 8])[0])
+            pos += 8
+        val_data = data[pos : pos + val_len]
+        pos += val_len
+        values = torch.from_numpy(
+            np.frombuffer(val_data, dtype=np.float16).reshape(val_shape).copy()
+        ).to(device)
+
+        layers.append((keys, values))
+
+    return tuple(layers)
+
+
+def unpack_kv_cache(
+    data: bytes,
+    device: str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Unpack KV cache from byte buffer with version detection.
+
+    Supports both v1 (flat) and v2 (per-layer) formats for backward compatibility.
+
+    Args:
+        data: Packed bytes from pack_kv_cache or pack_kv_cache_v2
+        device: Target device
+
+    Returns:
+        V1: Tuple of (keys, values) tensors
+        V2: Tuple of (key, value) pairs for each layer
+    """
+    # Check if this is v2 format (starts with version byte 0x02)
+    if len(data) > 0 and data[0] == 0x02:
+        return unpack_kv_cache_v2(data, device)
+
+    # V1 format (legacy)
     pos = 0
 
     # Read header

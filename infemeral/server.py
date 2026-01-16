@@ -20,7 +20,7 @@ from infemeral.config import server_settings
 from infemeral.crypto import decrypt_bytes, encrypt_bytes
 from infemeral.tensors import (
     deserialize_tensor,
-    pack_kv_cache,
+    pack_kv_cache_v2,
     serialize_tensor,
     unpack_kv_cache,
 )
@@ -131,10 +131,11 @@ def load_kv_cache(
     session_id: str,
     session_key: bytes,
     device: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
     """Load encrypted KV cache from Network Volume.
 
     Returns None if no cache exists for this session.
+    Returns tuple of (key, value) pairs for each layer.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,26 +153,46 @@ def load_kv_cache(
         # Decrypt
         plaintext = decrypt_bytes(ciphertext, session_key, nonce)
 
-        # Unpack KV tensors
-        keys, values = unpack_kv_cache(plaintext, device)
-        return keys, values
+        # Unpack KV tensors (auto-detects v1 or v2 format)
+        result = unpack_kv_cache(plaintext, device)
+
+        # If v1 format (flat tensors), return None to force rebuild
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], torch.Tensor):
+            logger.warning(f"Session {session_id[:8]} has v1 KV cache, ignoring (will rebuild)")
+            return None
+
+        # Validate layer count matches model
+        if _config is not None:
+            expected_layers = _config.num_hidden_layers
+            if len(result) != expected_layers:
+                logger.warning(
+                    f"KV cache layer count mismatch: expected {expected_layers}, got {len(result)}"
+                )
+                return None
+
+        return result
 
     except Exception as e:
-        print(f"Failed to load KV cache: {e}")
+        logger.warning(f"Failed to load KV cache: {e}")
         return None
 
 
 def save_kv_cache(
     session_id: str,
-    keys: torch.Tensor,
-    values: torch.Tensor,
+    kv_tuples: tuple[tuple[torch.Tensor, torch.Tensor], ...],
     session_key: bytes,
 ) -> None:
-    """Save encrypted KV cache to Network Volume."""
+    """Save encrypted KV cache to Network Volume.
+
+    Args:
+        session_id: Session identifier
+        kv_tuples: Tuple of (key, value) pairs for each layer
+        session_key: Encryption key
+    """
     cache_path = get_kv_cache_path(session_id)
 
     # Pack and encrypt
-    plaintext = pack_kv_cache(keys, values)
+    plaintext = pack_kv_cache_v2(kv_tuples)
     ciphertext, nonce = encrypt_bytes(plaintext, session_key)
 
     # Write nonce + ciphertext
@@ -185,6 +206,38 @@ def delete_kv_cache(session_id: str) -> None:
     cache_path = get_kv_cache_path(session_id)
     if cache_path.exists():
         cache_path.unlink()
+
+
+def cleanup_old_sessions(max_age_seconds: int = 3600) -> int:
+    """Delete KV cache files older than max_age.
+
+    Args:
+        max_age_seconds: Maximum age in seconds (default: 1 hour)
+
+    Returns:
+        Number of sessions cleaned up
+    """
+    import time
+
+    kv_dir = Path(server_settings.kv_cache_dir)
+    if not kv_dir.exists():
+        return 0
+
+    now = time.time()
+    cleaned = 0
+
+    for cache_file in kv_dir.glob("*.bin"):
+        try:
+            if now - cache_file.stat().st_mtime > max_age_seconds:
+                cache_file.unlink()
+                cleaned += 1
+        except Exception as e:
+            logger.warning(f"Failed to clean {cache_file.name}: {e}")
+
+    if cleaned > 0:
+        logger.info(f"Cleaned up {cleaned} old KV cache sessions")
+
+    return cleaned
 
 
 def _detect_actual_head_dim(
@@ -241,6 +294,52 @@ def _create_rotary_embeddings_with_correct_dim(
     return cos, sin
 
 
+def apply_context_windowing(
+    past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    max_length: int,
+    sink_tokens: int = 4,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Apply attention sink + sliding window to KV cache.
+
+    Strategy: Keep first `sink_tokens` and last `max_length - sink_tokens` tokens.
+
+    Args:
+        past_key_values: Per-layer KV cache
+        max_length: Maximum context length
+        sink_tokens: Number of initial tokens to always preserve
+
+    Returns:
+        Windowed KV cache
+    """
+    if not past_key_values:
+        return past_key_values
+
+    # Check current length (from first layer's key tensor)
+    current_len = past_key_values[0][0].shape[2]
+
+    if current_len <= max_length:
+        return past_key_values
+
+    # Apply windowing to each layer
+    windowed = []
+    keep_recent = max_length - sink_tokens
+
+    for keys, values in past_key_values:
+        # Keep: [0:sink_tokens] + [-(keep_recent):]
+        windowed_keys = torch.cat([keys[:, :, :sink_tokens, :], keys[:, :, -keep_recent:, :]], dim=2)
+        windowed_values = torch.cat(
+            [values[:, :, :sink_tokens, :], values[:, :, -keep_recent:, :]], dim=2
+        )
+        windowed.append((windowed_keys, windowed_values))
+
+    logger.warning(
+        f"Applied context windowing: {current_len} -> {max_length} "
+        f"(kept {sink_tokens} sink + {keep_recent} recent tokens)"
+    )
+
+    return tuple(windowed)
+
+
 def forward_transformer(
     model: torch.nn.Module,
     hidden_states: torch.Tensor,
@@ -262,6 +361,14 @@ def forward_transformer(
         norm = transformer.norm
     else:
         raise ValueError("Unsupported model architecture")
+
+    # Apply context windowing if needed
+    if past_key_values is not None:
+        past_key_values = apply_context_windowing(
+            past_key_values,
+            server_settings.max_context_length,
+            server_settings.attention_sink_tokens,
+        )
 
     # Prepare attention mask and position IDs
     batch_size, seq_len, _ = hidden_states.shape
@@ -360,18 +467,15 @@ class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
             cloaked = deserialize_tensor(plaintext, shape, dtype, device=self.device)
 
             # Load KV cache if exists
-            kv_cache = load_kv_cache(session_id, session_key, self.device)
-            past_key_values = None
-            if kv_cache is not None:
-                # TODO: Convert to proper past_key_values format
-                pass
+            past_key_values = load_kv_cache(session_id, session_key, self.device)
 
             # Forward through transformer
             with torch.no_grad():
                 output, new_kv = forward_transformer(self.model, cloaked, past_key_values)
 
-            # Save updated KV cache (deferred to Phase 2)
-            # save_kv_cache(session_id, new_kv[0], new_kv[1], session_key)
+            # Save updated KV cache
+            if new_kv:
+                save_kv_cache(session_id, new_kv, session_key)
 
             # Serialize output
             output_data, output_shape, output_dtype = serialize_tensor(output)
@@ -417,6 +521,11 @@ def serve_grpc(port: int | None = None, max_workers: int = 4) -> None:
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+
+    # Cleanup old sessions on startup
+    cleaned = cleanup_old_sessions()
+    if cleaned > 0:
+        logger.info(f"Cleaned {cleaned} old session(s) on startup")
 
     logger.info("Loading model...")
     model = load_model()
@@ -521,19 +630,15 @@ def handler(event: dict) -> dict:
         session_id = inp["session_id"]
 
         # Load KV cache if exists
-        kv_cache = load_kv_cache(session_id, session_key, str(device))
-        past_key_values = None
-        if kv_cache is not None:
-            # TODO: Convert to proper past_key_values format
-            pass
+        past_key_values = load_kv_cache(session_id, session_key, str(device))
 
         # Forward through transformer
         with torch.no_grad():
             output, new_kv = forward_transformer(model, cloaked, past_key_values)
 
         # Save updated KV cache
-        # TODO: Implement tide-windowing for context > 2048
-        # save_kv_cache(session_id, new_kv[0], new_kv[1], session_key)
+        if new_kv:
+            save_kv_cache(session_id, new_kv, session_key)
 
         # Serialize output
         output_data, output_shape, output_dtype = serialize_tensor(output)
