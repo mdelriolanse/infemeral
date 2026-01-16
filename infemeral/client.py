@@ -193,14 +193,29 @@ class Client:
             prompt, return_tensors="pt").to(self.device)
         generated_ids = input_ids.clone()
 
-        for _ in range(max_new_tokens):
-            # Embed (client-only)
-            hidden = self.embedding.embed(generated_ids)
+        # PROMPT PHASE: Send full sequence for initial KV cache build
+        hidden = self.embedding.embed(generated_ids)
+        cloaked = cloak(hidden, self.cloaking_ctx)
+        server_output = self._call_server(cloaked)
+        uncloaked = uncloak(server_output, self.cloaking_ctx)
+        logits = self.embedding.de_embed(uncloaked[:, -1:, :])
+        next_token = self._sample(logits[:, -1, :], temperature, top_p)
+
+        if next_token.item() == self.tokenizer.eos_token_id:
+            return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
+        generated_ids = torch.cat([generated_ids, next_token.unsqueeze(0)], dim=1)
+
+        # GENERATION PHASE: Send only new token for subsequent iterations
+        for _ in range(max_new_tokens - 1):
+            # Embed only the last token
+            last_token = generated_ids[:, -1:]
+            hidden = self.embedding.embed(last_token)
 
             # Cloak (orthogonal rotation + DP noise)
             cloaked = cloak(hidden, self.cloaking_ctx)
 
-            # Send to server
+            # Send to server (server will load KV cache by session_id)
             server_output = self._call_server(cloaked)
 
             # Uncloak
