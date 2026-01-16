@@ -20,7 +20,7 @@ class ClientSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INFEMERAL_CLIENT_")
 
     weights_path: str = Field(
-        default="./client_weights.safetensors",
+        default="/workspace/weights/client_weights.safetensors",
         description="Path to client embedding weights",
     )
     server_url: str = Field(
@@ -28,7 +28,7 @@ class ClientSettings(BaseSettings):
         description="gRPC server URL",
     )
     model_id: str = Field(
-        default="TheBloke/LLaMA-Pro-8B-AWQ",
+        default="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
         description="Base model ID for tokenizer",
     )
 
@@ -38,12 +38,20 @@ class ServerSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="INFEMERAL_SERVER_")
 
-    weights_path: str = Field(
-        default="/workspace/server_weights.safetensors",
-        description="Path to tensorized server weights",
+    weights_dir: str = Field(
+        default="/workspace/weights/model",
+        description="Directory containing the full AWQ model (loaded via from_pretrained)",
+    )
+    tensorized_weights_path: str = Field(
+        default="/workspace/weights/model.tensors",
+        description="Path to tensorized server model weights (optional, for fast loading)",
+    )
+    model_id: str = Field(
+        default="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+        description="HuggingFace model ID for architecture/config",
     )
     kv_cache_dir: str = Field(
-        default="/workspace/kv",
+        default="/workspace/weights/kv",
         description="Directory for encrypted KV cache storage",
     )
     max_context_length: int = Field(default=2048, description="Maximum context length")

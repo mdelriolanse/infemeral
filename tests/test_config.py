@@ -55,9 +55,9 @@ class TestClientSettings:
         """Check default client parameters."""
         settings = ClientSettings()
 
-        assert settings.weights_path == "./client_weights.safetensors"
+        assert settings.weights_path == "/workspace/weights/client_weights.safetensors"
         assert settings.server_url == "localhost:50051"
-        assert settings.model_id == "TheBloke/LLaMA-Pro-8B-AWQ"
+        assert settings.model_id == "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 
     def test_env_override(self):
         """Environment variables should override defaults."""
@@ -83,8 +83,9 @@ class TestServerSettings:
         """Check default server parameters."""
         settings = ServerSettings()
 
-        assert settings.weights_path == "/runpod-volume/server_weights.tensors"
-        assert settings.kv_cache_dir == "/runpod-volume/kv"
+        assert settings.weights_dir == "/workspace/weights/model"
+        assert settings.tensorized_weights_path == "/workspace/weights/model.tensors"
+        assert settings.kv_cache_dir == "/workspace/weights/kv"
         assert settings.max_context_length == 2048
         assert settings.attention_sink_tokens == 4
         assert settings.grpc_port == 50051
@@ -94,7 +95,8 @@ class TestServerSettings:
         with mock.patch.dict(
             os.environ,
             {
-                "INFEMERAL_SERVER_WEIGHTS_PATH": "/data/model.tensors",
+                "INFEMERAL_SERVER_WEIGHTS_DIR": "/data/model",
+                "INFEMERAL_SERVER_TENSORIZED_WEIGHTS_PATH": "/data/model.tensors",
                 "INFEMERAL_SERVER_KV_CACHE_DIR": "/data/cache",
                 "INFEMERAL_SERVER_MAX_CONTEXT_LENGTH": "4096",
                 "INFEMERAL_SERVER_ATTENTION_SINK_TOKENS": "8",
@@ -103,7 +105,8 @@ class TestServerSettings:
         ):
             settings = ServerSettings()
 
-            assert settings.weights_path == "/data/model.tensors"
+            assert settings.weights_dir == "/data/model"
+            assert settings.tensorized_weights_path == "/data/model.tensors"
             assert settings.kv_cache_dir == "/data/cache"
             assert settings.max_context_length == 4096
             assert settings.attention_sink_tokens == 8
@@ -129,8 +132,8 @@ class TestSettingsInteraction:
         crypto = CryptoSettings()
         client = ClientSettings()
 
-        # LLaMA-Pro-8B has hidden_dim=4096
-        if "LLaMA-Pro-8B" in client.model_id:
+        # Llama-3.1-8B has hidden_dim=4096
+        if "Llama-3.1-8B" in client.model_id:
             assert crypto.hidden_dim == 4096
 
     def test_singleton_instances_exist(self):
