@@ -46,6 +46,7 @@ class GenerationMetrics:
 from infemeral.crypto import (
     cloak,
     create_cloaking_context,
+    decrypt_bytes,
     encrypt_bytes,
     generate_session_key,
     uncloak,
@@ -98,11 +99,14 @@ class EmbeddingLayer(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert token IDs to hidden states."""
         with torch.no_grad():
-            return self.embed_tokens(input_ids)
+            # Upcast to float32 for server compatibility (attention requires matching dtypes)
+            return self.embed_tokens(input_ids).float()
 
     def de_embed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Convert hidden states to logits."""
         with torch.no_grad():
+            # Match dtype of lm_head weights
+            hidden_states = hidden_states.to(self.lm_head.weight.dtype)
             return self.lm_head(hidden_states)
 
 
@@ -224,9 +228,15 @@ class Client:
         if response.error:
             raise RuntimeError(f"Server error: {response.error}")
 
+        # Decrypt response (server sends nonce + encrypted_data)
+        response_data = bytes(response.output)
+        response_nonce = response_data[:12]
+        encrypted_output = response_data[12:]
+        decrypted_output = decrypt_bytes(encrypted_output, self.session_key, response_nonce)
+
         # Deserialize response
         return deserialize_tensor(
-            response.output,
+            decrypted_output,
             list(response.shape),
             response.dtype,
             device=self.device,

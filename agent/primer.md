@@ -1,6 +1,6 @@
 # Infemeral Agent Primer
 
-**Generated**: 2026-01-15_20-13-26
+**Generated**: 2026-01-16_22-35-26
 
 ## Tech Stack
 
@@ -9,7 +9,7 @@
 | Language | Python 3.11+ |
 | ML Framework | PyTorch, Transformers, vLLM |
 | Model Format | SafeTensors, Tensorizer (fast loading) |
-| Quantization | AWQ (4-bit INT4) |
+| Quantization | AWQ (4-bit INT4) via AutoAWQ |
 | Transport | gRPC + Protocol Buffers |
 | Crypto | AES-256-GCM, Haar-distributed orthogonal matrices |
 | Config | Pydantic Settings (env vars) |
@@ -43,7 +43,8 @@
 │                              │                                   │
 │                              ▼                                   │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │         Encrypted KV Cache (AES-256-GCM @ Redis/Disk)      │  │
+│  │         Encrypted KV Cache (AES-256-GCM @ Disk)            │  │
+│  │         Per-layer storage with context windowing           │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -59,34 +60,40 @@
 | Context | Entry Point |
 |---------|-------------|
 | Client CLI | `infemeral/client.py:main()` |
+| Server gRPC | `infemeral/server.py:serve_grpc()` |
 | Server (RunPod) | `infemeral/server.py:handler()` |
 | gRPC Service | `tensor_service.proto` → `TensorInference.Infer()` |
 
 ## 5 Critical Files for Development
 
 1. **`infemeral/client.py`** - Client inference loop
-   - `EmbeddingLayer`: Loads embed_tokens + lm_head from SafeTensors
-   - `Client.generate()`: Tokenize → embed → cloak → call server → uncloak → de-embed → sample
-   - `Client._call_server()`: gRPC transport with encryption
+   - `EmbeddingLayer`: Loads embed_tokens + lm_head from SafeTensors (supports tied embeddings)
+   - `Client.generate()`: Two-phase generation (prompt phase → generation phase)
+   - `Client._call_server()`: gRPC transport with AES-256-GCM encryption
+   - `TokenTiming`/`GenerationMetrics`: Performance instrumentation
 
 2. **`infemeral/server.py`** - Server inference handler
-   - `load_model()`: Tensorizer (fast) → SafeTensors (fallback) with AWQ support
-   - `forward_transformer()`: Bypasses embedding layer, feeds hidden states directly to transformer blocks
-   - `handler()`: RunPod serverless entry; decrypts input, runs inference, encrypts output
+   - `load_model()`: Tensorizer (fast) → from_pretrained (fallback) with AWQ support
+   - `forward_transformer()`: Bypasses embedding layer, feeds hidden states to transformer blocks
+   - `apply_context_windowing()`: Attention sink + sliding window for KV cache management
+   - `TensorInferenceServicer`: gRPC servicer with per-request KV cache load/save
+   - `handler()`: RunPod serverless entry
 
 3. **`infemeral/crypto.py`** - Cryptographic primitives
    - `generate_orthogonal_matrix()`: Haar-distributed via QR decomposition
-   - `cloak()/uncloak()`: Orthogonal rotation + DP noise
+   - `create_cloaking_context()`: Session-scoped matrix + DP sigma
+   - `cloak()/uncloak()`: Orthogonal rotation + DP noise (einsum-based)
    - `encrypt_bytes()/decrypt_bytes()`: AES-256-GCM
 
 4. **`infemeral/config.py`** - Environment-based configuration
    - `CryptoSettings`: hidden_dim, dp_epsilon, dp_delta
    - `ClientSettings`: weights_path, server_url, model_id
-   - `ServerSettings`: weights_path, tensorized_weights_path, kv_cache_dir, model_id
+   - `ServerSettings`: weights_dir, tensorized_weights_path, kv_cache_dir, max_context_length, attention_sink_tokens
 
 5. **`infemeral/tensors.py`** - Tensor serialization
-   - `serialize_tensor()/deserialize_tensor()`: PyTorch ↔ bytes for gRPC
-   - `pack_kv_cache()/unpack_kv_cache()`: Binary format for KV storage
+   - `serialize_tensor()/deserialize_tensor()`: PyTorch ↔ bytes for gRPC (handles bfloat16)
+   - `pack_kv_cache_v2()/unpack_kv_cache_v2()`: Per-layer KV binary format with version header
+   - `compress_tensor_data()/decompress_tensor_data()`: Optional LZ4 compression
 
 ## Key Data Flow
 
@@ -103,7 +110,7 @@ embed_tokens(input_ids) → hidden [1, seq_len, 4096]
 cloak(hidden, M, σ) → cloaked [1, seq_len, 4096]
     │
     ▼ (gRPC + AES-256-GCM)
-forward_transformer(cloaked) → server_output [1, seq_len, 4096]
+forward_transformer(cloaked, past_kv) → server_output [1, seq_len, 4096], new_kv
     │
     ▼ (gRPC + AES-256-GCM)
 uncloak(server_output, M) → uncloaked [1, seq_len, 4096]
@@ -113,6 +120,8 @@ lm_head(uncloaked[:, -1:, :]) → logits [1, 1, vocab_size]
     │
     ▼
 sample(logits) → next_token
+
+[Generation phase: send only last token, server uses KV cache]
 ```
 
 ## Configuration (Environment Variables)
@@ -129,10 +138,13 @@ INFEMERAL_CLIENT_SERVER_URL=localhost:50051
 INFEMERAL_CLIENT_MODEL_ID=hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
 
 # Server
+INFEMERAL_SERVER_WEIGHTS_DIR=/workspace/weights/model
 INFEMERAL_SERVER_TENSORIZED_WEIGHTS_PATH=/workspace/weights/model.tensors
-INFEMERAL_SERVER_WEIGHTS_PATH=/workspace/weights/model.safetensors
 INFEMERAL_SERVER_MODEL_ID=hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
 INFEMERAL_SERVER_KV_CACHE_DIR=/workspace/weights/kv
+INFEMERAL_SERVER_MAX_CONTEXT_LENGTH=2048
+INFEMERAL_SERVER_ATTENTION_SINK_TOKENS=4
+INFEMERAL_SERVER_GRPC_PORT=50051
 ```
 
 ## Common Development Tasks
@@ -157,7 +169,15 @@ ruff format .
 
 ## Current Development Notes
 
-The server currently handles AWQ quantized models (Llama 3.1 8B). Recent work addressed:
-- Rotary embedding dimension mismatches with transformers 4.46+ and AWQ models
-- Position embeddings must be passed explicitly to attention layers
-- Tensorizer integration for faster model loading (~10x vs SafeTensors)
+**Recent Work (2026-01)**:
+- **Two-phase generation**: Prompt phase sends full sequence, generation phase sends only new token (relies on server KV cache)
+- **Per-layer KV cache**: v2 binary format stores (key, value) tuples per transformer layer with proper shape validation
+- **Context windowing**: Attention sink (first N tokens) + sliding window to bound KV cache growth
+- **DynamicCache integration**: Server converts tuple-based cache to transformers `DynamicCache` for layer compatibility
+- **Performance instrumentation**: `TokenTiming` and `GenerationMetrics` classes for profiling per-token latency breakdown
+
+**Known Considerations**:
+- Rotary embeddings computed per-layer using each layer's `rotary_emb` module
+- Position IDs must account for `past_len` when KV cache exists
+- AWQ quantized models loaded via `AutoModelForCausalLM.from_pretrained` with `device_map`
+- Tensorizer path checked first for faster cold starts (~10x vs SafeTensors)

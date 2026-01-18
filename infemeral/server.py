@@ -24,6 +24,7 @@ from infemeral.tensors import (
     serialize_tensor,
     unpack_kv_cache,
 )
+from transformers.cache_utils import DynamicCache
 
 # Import gRPC stubs - handle both installed and development import paths
 try:
@@ -377,21 +378,37 @@ def forward_transformer(
     # Create causal attention mask
     attention_mask = torch.ones(batch_size, seq_len, device=device)
 
-    # Position IDs
+    # Convert tuple-based cache to DynamicCache for transformers compatibility
+    cache = None
+    past_len = 0
     if past_key_values is not None:
+        cache = DynamicCache()
+        for layer_idx, (k, v) in enumerate(past_key_values):
+            logger.info(f"Loading layer {layer_idx} cache: key={k.shape}, value={v.shape}")
+            if k.shape != v.shape:
+                logger.error(f"MISMATCH at layer {layer_idx}: key={k.shape} vs value={v.shape}")
+            cache.update(k, v, layer_idx)
         past_len = past_key_values[0][0].shape[2]
+        logger.info(f"Loaded cache with {len(past_key_values)} layers, past_len={past_len}")
+
+    # Position IDs
+    if past_len > 0:
         position_ids = torch.arange(
             past_len, past_len + seq_len, device=device
         ).unsqueeze(0)
     else:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
-    new_key_values = []
-
     for i, layer in enumerate(layers):
-        past_kv = past_key_values[i] if past_key_values else None
-
         layer_attn = layer.self_attn
+
+        # Debug: log cache state before layer call
+        if cache is not None and hasattr(cache, 'layers'):
+            logger.info(f"Layer {i} input - cache has {len(cache.layers)} entries")
+            for idx, layer_cache in enumerate(cache.layers):
+                logger.info(f"  Cache[{idx}]: key={layer_cache.keys.shape}, value={layer_cache.values.shape}")
+        else:
+            logger.info(f"Layer {i} input - cache is None")
 
         # Get rotary embedding module (try layer-specific first, then global)
         layer_rotary_emb = getattr(layer_attn, "rotary_emb", None)
@@ -405,27 +422,47 @@ def forward_transformer(
         cos, sin = layer_rotary_emb(hidden_states, position_ids)
         layer_position_embeddings = (cos, sin)
 
-        layer_outputs = layer(
+        logger.info(f"Layer {i}: calling with hidden_states={hidden_states.shape}, cache={type(cache)}")
+        layer_out = layer(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_kv,
+            past_key_values=cache,  # plural - required for transformers 4.57+
             use_cache=True,
             position_embeddings=layer_position_embeddings,
         )
 
-        hidden_states = layer_outputs[0]
+        # Handle both tensor and tuple returns
+        if isinstance(layer_out, torch.Tensor):
+            # Layer returned tensor directly (no cache)
+            hidden_states = layer_out
+            layer_cache = None
+        else:
+            # Layer returned tuple (hidden_states, cache, ...)
+            hidden_states = layer_out[0]
+            layer_cache = layer_out[1] if len(layer_out) > 1 else None
 
         # Ensure hidden_states maintains 3D shape [batch, seq_len, hidden_dim]
-        # Some layer implementations squeeze the seq_len dimension when seq_len=1
         if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(1)
+            hidden_states = hidden_states.unsqueeze(0)  # Add batch dim, not seq dim
 
-        if len(layer_outputs) > 1 and layer_outputs[1] is not None:
-            new_key_values.append(layer_outputs[1])
+        # Update cache reference
+        if layer_cache is not None:
+            cache = layer_cache
 
     # Final layer norm
     hidden_states = norm(hidden_states)
+
+    # Extract KV tuples from DynamicCache for storage
+    new_key_values = []
+    if cache is not None and hasattr(cache, 'layers'):
+        for layer_idx, layer_cache in enumerate(cache.layers):
+            k = layer_cache.keys
+            v = layer_cache.values
+            logger.info(f"Saving layer {layer_idx} cache: key={k.shape}, value={v.shape}")
+            if k.shape != v.shape:
+                logger.error(f"SAVE MISMATCH at layer {layer_idx}: key={k.shape} vs value={v.shape}")
+            new_key_values.append((k, v))
 
     return hidden_states, tuple(new_key_values) if new_key_values else ()
 
@@ -484,7 +521,7 @@ class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
             encrypted_output, output_nonce = encrypt_bytes(output_data, session_key)
 
             # Memory wipe
-            del cloaked, output, kv_cache
+            del cloaked, output, new_kv
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -647,7 +684,7 @@ def handler(event: dict) -> dict:
         encrypted_output, output_nonce = encrypt_bytes(output_data, session_key)
 
         # Memory wipe
-        del cloaked, output, kv_cache
+        del cloaked, output, new_kv
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

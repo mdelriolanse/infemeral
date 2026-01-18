@@ -11,25 +11,22 @@ dependencies = [
     "vllm>=0.6.0",
     "tensorizer>=2.9.0",
     "accelerate>=1.12.0",
-
     # Crypto
     "cryptography>=42.0.0",
     "scipy>=1.14.0",
-
     # Compression
     "lz4>=4.3.0",
-
     # gRPC
     "grpcio>=1.66.0",
     "grpcio-tools>=1.66.0",
     "protobuf>=5.27.0",
-
     # Config
     "pydantic>=2.8.0",
     "pydantic-settings>=2.4.0",
-
     # RunPod
     "runpod>=1.7.0",
+    "autoawq>=0.2.9",
+    "intel-extension-for-pytorch>=2.8.0",
 ]
 
 [project.optional-dependencies]
