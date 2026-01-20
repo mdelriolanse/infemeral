@@ -1,6 +1,6 @@
 # Infemeral Agent Primer
 
-**Generated**: 2026-01-16_22-35-26
+**Generated**: 2026-01-19_20-37-46
 
 ## Tech Stack
 
@@ -181,3 +181,147 @@ ruff format .
 - Position IDs must account for `past_len` when KV cache exists
 - AWQ quantized models loaded via `AutoModelForCausalLM.from_pretrained` with `device_map`
 - Tensorizer path checked first for faster cold starts (~10x vs SafeTensors)
+
+## File Deployment
+
+After modifying server files, deploy to RunPod using:
+```bash
+./scp_to_runpod.sh <pod_ip> <port> <filename> [remote_target_dir]
+```
+
+Example:
+```bash
+./scp_to_runpod.sh 203.57.40.146 10017 infemeral/server.py
+```
+
+## RunPod Environment Setup
+
+### SSH Connection
+
+```bash
+ssh -o StrictHostKeyChecking=no -p <port> root@<pod_ip>
+```
+
+### Virtual Environment (uv)
+
+The project uses `uv` as the package manager. The virtual environment is located at `/mnt/.venv` (persistent storage).
+
+**Critical**: Set the environment variable before any `uv` commands:
+```bash
+export UV_PROJECT_ENVIRONMENT=/mnt/.venv
+```
+
+### Running Python Commands
+
+**Option 1**: Use full path to Python (recommended for SSH commands):
+```bash
+/mnt/.venv/bin/python -m infemeral.server
+```
+
+**Option 2**: Use `uv run` with env var set:
+```bash
+export UV_PROJECT_ENVIRONMENT=/mnt/.venv
+uv run -- python -m infemeral.server
+```
+
+**Option 3**: For local testing with uv on RunPod:
+```bash
+export UV_PROJECT_ENVIRONMENT=/mnt/.venv
+cd /workspace/infemeral-src
+uv run -- python -c "from infemeral.client import Client; print('OK')"
+```
+
+### Dependency Management
+
+Check installed packages:
+```bash
+export UV_PROJECT_ENVIRONMENT=/mnt/.venv
+uv pip list
+```
+
+Install a specific package:
+```bash
+export UV_PROJECT_ENVIRONMENT=/mnt/.venv
+uv pip install 'transformers==4.51.3' --python /mnt/.venv/bin/python
+```
+
+**Warning**: Running `uv run` without setting `UV_PROJECT_ENVIRONMENT` may create a new venv and reinstall all dependencies, potentially upgrading packages to incompatible versions.
+
+### Server Management
+
+Start server (background):
+```bash
+ssh -p <port> root@<pod_ip> "cd /workspace/infemeral-src && /mnt/.venv/bin/python -m infemeral.server > /tmp/server.log 2>&1 &"
+```
+
+Check server logs:
+```bash
+ssh -p <port> root@<pod_ip> "tail -50 /tmp/server.log"
+```
+
+Kill server:
+```bash
+ssh -p <port> root@<pod_ip> "pkill -9 python"
+```
+
+Check GPU memory:
+```bash
+ssh -p <port> root@<pod_ip> "nvidia-smi"
+```
+
+Clear KV cache:
+```bash
+ssh -p <port> root@<pod_ip> "rm -rf /workspace/weights/kv/*"
+```
+
+### Known Issues
+
+1. **Transformers version**: AutoAWQ is deprecated and only tested with `transformers==4.51.3`. The `uv run` command may auto-upgrade to newer versions that break AWQ imports. Always pin: `uv pip install 'transformers==4.51.3'`
+
+2. **Client embedding loading**: Loading the 2GB `client_weights.safetensors` takes ~50-60 seconds. Use appropriate timeouts.
+
+3. **GPU memory**: The server uses ~6GB VRAM. The client embeddings need ~2GB. Both can run on a single RTX 4090 (24GB).
+
+### Directory Structure on RunPod
+
+```
+/workspace/
+├── infemeral-src/          # Source code (synced via scp)
+│   └── infemeral/
+│       ├── client.py
+│       ├── server.py
+│       └── ...
+└── weights/
+    ├── client_weights.safetensors  # Client embedding weights (2.1GB)
+    ├── model/                       # Full AWQ model for server
+    ├── tokenizer/                   # Tokenizer files
+    └── kv/                          # Encrypted KV cache storage
+/mnt/
+└── .venv/                  # Persistent virtual environment
+```
+
+### Quick Test Workflow
+
+```bash
+# 1. Deploy updated code
+./scp_to_runpod.sh 203.57.40.146 10017 infemeral/server.py
+
+# 2. Restart server on RunPod
+ssh -p 10017 root@203.57.40.146 "pkill -9 python; sleep 2 && cd /workspace/infemeral-src && /mnt/.venv/bin/python -m infemeral.server > /tmp/server.log 2>&1 &"
+
+# 3. Wait for model load (~20s)
+sleep 20
+
+# 4. Check server started
+ssh -p 10017 root@203.57.40.146 "tail -5 /tmp/server.log"
+# Should show: "gRPC server started on port 50051"
+
+# 5. Run client test
+ssh -p 10017 root@203.57.40.146 "cd /workspace/infemeral-src && timeout 180 /mnt/.venv/bin/python -c \"
+from infemeral.client import Client
+client = Client(weights_path='/workspace/weights/client_weights.safetensors', device='cpu')
+result = client.generate('Hello', max_new_tokens=10)
+print(f'Result: {repr(result)}')
+client.close()
+\""
+```
