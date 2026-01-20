@@ -2,6 +2,11 @@ Dockerfile.local
 CLAUDE.md
 .claude/
 
+# Project notes (not for version control)
+SYSTEM_RUNDOWN.md
+TODO.md
+COPYWRITING_SPEC.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
