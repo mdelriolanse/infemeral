@@ -207,7 +207,7 @@ def unpack_kv_cache_v2(
         pos += key_len
         keys = torch.from_numpy(
             np.frombuffer(key_data, dtype=np.float16).reshape(key_shape).copy()
-        ).to(device)
+        ).to(device).contiguous()
 
         # Unpack value
         val_len = struct.unpack("<I", data[pos : pos + 4])[0]
@@ -222,7 +222,7 @@ def unpack_kv_cache_v2(
         pos += val_len
         values = torch.from_numpy(
             np.frombuffer(val_data, dtype=np.float16).reshape(val_shape).copy()
-        ).to(device)
+        ).to(device).contiguous()
 
         layers.append((keys, values))
 
@@ -268,13 +268,13 @@ def unpack_kv_cache(
     pos += key_len
     val_data = data[pos : pos + key_len]  # Same length as keys
 
-    # Reconstruct tensors
+    # Reconstruct tensors (contiguous() required for SDPA attention)
     keys = torch.from_numpy(
         np.frombuffer(key_data, dtype=np.float16).reshape(shape).copy()
-    ).to(device)
+    ).to(device).contiguous()
     values = torch.from_numpy(
         np.frombuffer(val_data, dtype=np.float16).reshape(shape).copy()
-    ).to(device)
+    ).to(device).contiguous()
 
     return keys, values
 
