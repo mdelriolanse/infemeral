@@ -104,11 +104,13 @@ def load_model(device: str | None = None) -> torch.nn.Module:
         _config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
 
         # Load model (handles AWQ automatically)
+        # Use eager attention to avoid SDPA contiguity issues with cached KV tensors
         _model = AutoModelForCausalLM.from_pretrained(
             weights_dir,
             torch_dtype=torch.float16,
             device_map=device,
             trust_remote_code=True,
+            attn_implementation="eager",
         )
         print("Model loaded successfully")
 
@@ -374,22 +376,30 @@ def forward_transformer(
     # Prepare attention mask and position IDs
     batch_size, seq_len, _ = hidden_states.shape
     device = hidden_states.device
+    dtype = hidden_states.dtype
 
-    # Create causal attention mask
-    attention_mask = torch.ones(batch_size, seq_len, device=device)
-
-    # Convert tuple-based cache to DynamicCache for transformers compatibility
-    cache = None
+    # Always initialize DynamicCache - layers require a cache object to return updated cache
+    # When past_key_values=None is passed, layers return Tensor instead of (Tensor, Cache) tuple
+    cache = DynamicCache()
     past_len = 0
     if past_key_values is not None:
-        cache = DynamicCache()
+        # Directly populate cache lists instead of using update() to avoid torch.cat() non-contiguity
+        # DynamicCache.update() concatenates tensors, creating non-contiguous views
         for layer_idx, (k, v) in enumerate(past_key_values):
-            logger.info(f"Loading layer {layer_idx} cache: key={k.shape}, value={v.shape}")
-            if k.shape != v.shape:
-                logger.error(f"MISMATCH at layer {layer_idx}: key={k.shape} vs value={v.shape}")
-            cache.update(k, v, layer_idx)
+            # Ensure tensors are contiguous for SDPA attention
+            k_contig = k.contiguous()
+            v_contig = v.contiguous()
+            logger.info(f"Loading layer {layer_idx} cache: key={k_contig.shape}, value={v_contig.shape}, "
+                       f"key.is_contiguous={k_contig.is_contiguous()}, value.is_contiguous={v_contig.is_contiguous()}")
+            if k_contig.shape != v_contig.shape:
+                logger.error(f"MISMATCH at layer {layer_idx}: key={k_contig.shape} vs value={v_contig.shape}")
+            # Directly append to cache lists - avoids torch.cat() in update()
+            cache.key_cache.append(k_contig)
+            cache.value_cache.append(v_contig)
         past_len = past_key_values[0][0].shape[2]
         logger.info(f"Loaded cache with {len(past_key_values)} layers, past_len={past_len}")
+    else:
+        logger.info("Initialized empty DynamicCache for first forward pass")
 
     # Position IDs
     if past_len > 0:
@@ -399,16 +409,30 @@ def forward_transformer(
     else:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
+    # Create 4D causal attention mask for eager attention
+    # Shape: [batch_size, 1, seq_len, total_len] where total_len = past_len + seq_len
+    total_len = past_len + seq_len
+    # Create causal mask: each position can only attend to positions <= its own
+    causal_mask = torch.triu(
+        torch.ones(seq_len, total_len, dtype=dtype, device=device) * float("-inf"),
+        diagonal=past_len + 1,  # Allow attending to past + current position
+    )
+    # Expand to [batch_size, 1, seq_len, total_len]
+    attention_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+
     for i, layer in enumerate(layers):
         layer_attn = layer.self_attn
 
-        # Debug: log cache state before layer call
-        if cache is not None and hasattr(cache, 'layers'):
-            logger.info(f"Layer {i} input - cache has {len(cache.layers)} entries")
-            for idx, layer_cache in enumerate(cache.layers):
-                logger.info(f"  Cache[{idx}]: key={layer_cache.keys.shape}, value={layer_cache.values.shape}")
+        # Debug: log cache state before layer call (supports both 4.51 and 4.57+ API)
+        cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else len(cache)
+        if cache_len > 0:
+            logger.info(f"Layer {i} input - cache has {cache_len} entries")
+            if i == 0:  # Only log details for first layer to reduce noise
+                if hasattr(cache, 'key_cache'):
+                    for idx in range(min(3, len(cache.key_cache))):
+                        logger.info(f"  Cache[{idx}]: key={cache.key_cache[idx].shape}, value={cache.value_cache[idx].shape}")
         else:
-            logger.info(f"Layer {i} input - cache is None")
+            logger.info(f"Layer {i} input - cache empty (len={cache_len})")
 
         # Get rotary embedding module (try layer-specific first, then global)
         layer_rotary_emb = getattr(layer_attn, "rotary_emb", None)
@@ -427,7 +451,7 @@ def forward_transformer(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=cache,  # plural - required for transformers 4.57+
+            past_key_value=cache,  # singular - transformers 4.51.x API
             use_cache=True,
             position_embeddings=layer_position_embeddings,
         )
@@ -437,32 +461,56 @@ def forward_transformer(
             # Layer returned tensor directly (no cache)
             hidden_states = layer_out
             layer_cache = None
+            logger.info(f"Layer {i}: returned Tensor directly (no cache tuple)")
         else:
             # Layer returned tuple (hidden_states, cache, ...)
             hidden_states = layer_out[0]
             layer_cache = layer_out[1] if len(layer_out) > 1 else None
+            logger.info(f"Layer {i}: returned tuple len={len(layer_out)}, cache type={type(layer_cache)}")
 
         # Ensure hidden_states maintains 3D shape [batch, seq_len, hidden_dim]
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(0)  # Add batch dim, not seq dim
 
-        # Update cache reference
+        # Update cache reference (layer may return updated cache or modify in-place)
         if layer_cache is not None:
             cache = layer_cache
+            cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else len(cache)
+            logger.info(f"Layer {i}: updated cache reference, new cache has {cache_len} entries")
+        else:
+            # Check if original cache was updated in-place
+            cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else len(cache)
+            if cache_len > 0:
+                logger.info(f"Layer {i}: cache updated in-place, now has {cache_len} entries")
 
     # Final layer norm
     hidden_states = norm(hidden_states)
 
-    # Extract KV tuples from DynamicCache for storage
+    # Extract KV tuples from DynamicCache for storage (supports both 4.51 and 4.57+ API)
     new_key_values = []
-    if cache is not None and hasattr(cache, 'layers'):
-        for layer_idx, layer_cache in enumerate(cache.layers):
-            k = layer_cache.keys
-            v = layer_cache.values
-            logger.info(f"Saving layer {layer_idx} cache: key={k.shape}, value={v.shape}")
+    if hasattr(cache, 'key_cache') and len(cache.key_cache) > 0:
+        # Transformers 4.51.x API: key_cache/value_cache lists
+        for layer_idx in range(len(cache.key_cache)):
+            k = cache.key_cache[layer_idx]
+            v = cache.value_cache[layer_idx]
+            if layer_idx == 0:  # Log only first layer to reduce noise
+                logger.info(f"Saving cache: {len(cache.key_cache)} layers, first layer key={k.shape}")
             if k.shape != v.shape:
                 logger.error(f"SAVE MISMATCH at layer {layer_idx}: key={k.shape} vs value={v.shape}")
             new_key_values.append((k, v))
+    elif hasattr(cache, 'layers') and len(cache.layers) > 0:
+        # Transformers 4.57+ API: layers list with CacheLayer objects
+        for layer_idx, layer_cache in enumerate(cache.layers):
+            k = layer_cache.keys
+            v = layer_cache.values
+            if layer_idx == 0:
+                logger.info(f"Saving cache: {len(cache.layers)} layers, first layer key={k.shape}")
+            if k.shape != v.shape:
+                logger.error(f"SAVE MISMATCH at layer {layer_idx}: key={k.shape} vs value={v.shape}")
+            new_key_values.append((k, v))
+    else:
+        cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else (len(cache.layers) if hasattr(cache, 'layers') else 0)
+        logger.warning(f"No cache to save: cache has {cache_len} entries")
 
     return hidden_states, tuple(new_key_values) if new_key_values else ()
 
