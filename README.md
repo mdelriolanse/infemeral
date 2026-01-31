@@ -1,8 +1,8 @@
-# 💠 Infemeral
+# Infemeral
 
 **Zero-Trust Distributed LLM Inference with Stateless Server Architecture**
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/infemeral/infemeral)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/infemeral/infemeral)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11+-yellow.svg)](https://python.org)
 
@@ -12,41 +12,29 @@ Infemeral implements a **Split-Brain, Stateless Topology** that partitions LLM i
 
 ---
 
-## 🏛️ Architecture Overview
+## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         USER DEVICE (Trusted)                           │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐ │
-│  │  Tokenizer  │ → │  Embedder   │ → │  DP Noise   │ → │  Matrix M   │ │
-│  │  (text→ids) │   │  (ids→vec)  │   │  (ε=2.0)    │   │  (rotation) │ │
-│  └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘ │
-│         ↑                                                      ↓        │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐ │
-│  │   Decoder   │ ← │   LM Head   │ ← │  Matrix M⁻¹ │ ← │ gRPC Client │ │
-│  │  (ids→text) │   │  (vec→ids)  │   │  (inverse)  │   │  (TLS 1.3)  │ │
-│  └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-                                         │ cloaked vectors
-                                         ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       RUNPOD L4 WORKER (Untrusted)                      │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    vLLM + PagedAttention                         │   │
-│  │  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐          │   │
-│  │  │ Attn L1 │ → │ FFN L1  │ → │ Attn L2 │ → │   ...   │ → Output │   │
-│  │  └─────────┘   └─────────┘   └─────────┘   └─────────┘          │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│         ↑ fetch encrypted KV           ↓ store encrypted KV             │
-└─────────────────────────────────────────────────────────────────────────┘
-                           │                    │
-                           ↓                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      REDIS SIDECAR (Encrypted State)                    │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │   AES-256-GCM Encrypted KV Cache   │   TTL: 1hr   │   LRU: 2GB  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
+USER DEVICE (Trusted)
+├── Tokenizer + Embedding layer + LM head
+├── Orthogonal rotation matrix (M)
+├── Differential privacy noise injection
+└── AES-256-GCM encryption
+
+         ↓ (encrypted cloaked vectors)
+
+RUNPOD L4 WORKER (Untrusted)
+├── Transformer blocks only (no embeddings)
+├── AWQ quantized 4-bit weights
+├── KV cache management (encrypted)
+└── No access to rotation matrix M
+
+         ↓ (encrypted KV cache)
+
+FILE STORAGE (Encrypted State)
+├── AES-256-GCM encrypted KV cache
+├── Session-scoped keys
+└── Configurable retention (default: 1 hour)
 ```
 
 ### Trust Domains
@@ -55,44 +43,44 @@ Infemeral implements a **Split-Brain, Stateless Topology** that partitions LLM i
 |--------|-----------|-------|---------------|
 | **Sovereign Edge** | Client | Embedding layer, LM head, Matrix M | Nothing (fully trusted) |
 | **Blind Core** | Server | Transformer blocks only | Raw embeddings, Matrix M |
-| **Encrypted Locker** | Redis | AES-256-GCM encrypted KV | Unencrypted state |
+| **Encrypted Locker** | File Storage | AES-256-GCM encrypted KV | Unencrypted state |
 
 ---
 
-## 🔐 Security Properties
+## Security Properties
 
 ### Mathematical Guarantees
 
 1. **Embedding Privacy**: The server only sees rotated vectors: `x' = Mx + noise`
    - Matrix M is orthogonal → preserves dot products for attention
-   - Differential privacy noise (ε=2.0, δ=1e-5) prevents known-plaintext attacks
+   - Differential privacy noise prevents known-plaintext attacks
 
-2. **Forward Secrecy**: Session keys rotate after every request
-   - Compromise of current key doesn't expose past conversations
-   - HKDF key derivation with fresh entropy
-
-3. **State Confidentiality**: KV cache encrypted with AES-256-GCM
-   - Redis sidecar never sees plaintext
+2. **State Confidentiality**: KV cache encrypted with AES-256-GCM
+   - Storage layer never sees plaintext
    - Keys are session-specific and ephemeral
 
 ### What the Server Cannot Do
 
-- ❌ Read your prompts or responses
-- ❌ Reconstruct conversation history
-- ❌ Correlate requests across sessions
-- ❌ Access KV cache contents
-- ❌ Derive the rotation matrix M
+- Cannot read your prompts or responses
+- Cannot reconstruct conversation history
+- Cannot access KV cache contents
+- Cannot derive the rotation matrix M
+
+### Current Security Limitations
+
+- TLS is not currently enabled (use a TLS proxy in production)
+- Session keys are sent raw (RSA wrapping is planned)
+- No authentication/authorization mechanism yet
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
 - Python 3.11+
 - NVIDIA GPU with 24GB+ VRAM (L4, RTX 4090, A10G)
-- Docker & Docker Compose
-- NVIDIA Container Toolkit
+- HuggingFace account with access to gated models
 
 ### 1. Clone and Setup
 
@@ -100,21 +88,28 @@ Infemeral implements a **Split-Brain, Stateless Topology** that partitions LLM i
 git clone https://github.com/infemeral/infemeral.git
 cd infemeral
 
-# Install client dependencies
-pip install -r requirements.client.txt
-
-# Generate cryptographic keys
-python scripts/generate_keys.py --output-dir ~/.infemeral/keys
+# Install dependencies
+pip install -e .
 ```
 
-### 2. Extract Embedding Weights
+### 2. Prepare Model Weights
 
 ```bash
-# Extract client-side weights from model
-python scripts/extract_embeddings.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --output ~/.infemeral/weights
+# Download model and extract client weights
+python -c "
+from infemeral.model_prep import prepare_model
+prepare_model(
+    model_id='hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4',
+    output_dir='./weights',
+    tensorize=True  # Optional: faster loading
+)
+"
 ```
+
+This extracts:
+- **Client weights**: `client_weights.safetensors` (embedding layer + LM head)
+- **Server weights**: Full model directory for transformer blocks
+- **Tokenizer**: Required for text encoding/decoding
 
 ### 3. Build Proto Files
 
@@ -123,52 +118,67 @@ chmod +x proto/build_proto.sh
 ./proto/build_proto.sh
 ```
 
-### 4. Deploy Server
+### 4. Start Server
 
 ```bash
-# Set your HuggingFace token for gated models
-export HF_TOKEN=your_token_here
+# Set environment variables
+export INFEMERAL_SERVER_WEIGHTS_DIR=./weights/model
+export INFEMERAL_SERVER_KV_CACHE_DIR=./weights/kv
 
-# Start production stack
-docker compose -f docker-compose.prod.yml up -d
-
-# Check server health
-curl http://localhost:50051/health
+# Start gRPC server
+python -m infemeral.server --mode grpc --port 50051
 ```
 
 ### 5. Run Client
 
 ```bash
-# Interactive mode
-python -m client.main --server localhost:50051
+from infemeral.client import Client
 
-# Single prompt
-python -m client.main --server localhost:50051 \
-    --prompt "Explain quantum computing in simple terms"
+client = Client(
+    weights_path="./weights/client_weights.safetensors",
+    server_url="localhost:50051",
+    device="cuda"  # or "cpu"
+)
+
+# Generate text
+output = client.generate(
+    prompt="Explain quantum computing in simple terms",
+    max_new_tokens=100,
+    temperature=0.7,
+    top_p=0.9
+)
+print(output)
+
+# With performance metrics
+output, metrics = client.generate(
+    prompt="Hello, how are you?",
+    max_new_tokens=50,
+    return_metrics=True
+)
+print(f"Throughput: {metrics.tokens_per_second:.1f} tok/s")
+
+client.close()
 ```
 
 ---
 
-## ☁️ RunPod Serverless Deployment
+## RunPod Serverless Deployment
 
 For cost-effective deployment with pay-per-request pricing, deploy to RunPod Serverless.
 
 ### 1. Build and Push Docker Image
 
 ```bash
-# Build serverless image
-docker build -f Dockerfile.serverless -t your-registry/infemeral/serverless:latest .
-
-# Push to Docker Hub (or RunPod registry)
-docker push your-registry/infemeral/serverless:latest
+docker build -t your-registry/infemeral:latest .
+docker push your-registry/infemeral:latest
 ```
 
 ### 2. Create Network Volume
 
 In the RunPod console:
 1. Go to **Storage > Network Volumes**
-2. Create a new volume (10GB minimum for Redis persistence)
-3. Note the volume ID
+2. Create a new volume (10GB minimum for KV cache)
+3. Upload prepared model weights to the volume
 
 ### 3. Create Serverless Endpoint
 
@@ -176,163 +186,199 @@ In the RunPod console:
 1. Go to **Serverless > Endpoints**
 2. Click **New Endpoint**
 3. Configure:
-   - **Docker Image**: `your-registry/infemeral/serverless:latest`
+   - **Docker Image**: `your-registry/infemeral:latest`
    - **GPU**: NVIDIA L4 (24GB) recommended
    - **Environment Variables**:
-     - `MODEL_NAME`: `meta-llama/Llama-3.1-8B-Instruct`
-     - `HF_TOKEN`: Your HuggingFace token
+     - `INFEMERAL_SERVER_WEIGHTS_DIR`: `/workspace/weights/model`
+     - `INFEMERAL_SERVER_KV_CACHE_DIR`: `/workspace/weights/kv`
    - **Network Volume**: Attach the volume created above
 4. Deploy
 
-### 4. Run Client (Serverless)
+### Server Modes
 
 ```bash
-# Using HTTP transport with RunPod
-python -m client.main \
-    --transport http \
-    --runpod-api-key YOUR_RUNPOD_API_KEY \
-    --runpod-endpoint YOUR_ENDPOINT_ID \
-    --prompt "Explain quantum computing"
+# Traditional gRPC server
+python -m infemeral.server --mode grpc --port 50051
+
+# RunPod serverless HTTP handler
+python -m infemeral.server --mode runpod
 ```
-
-### Serverless Configuration
-
-See `runpod.toml` for detailed configuration options.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REDIS_EMBEDDED` | `true` | Run Redis as subprocess |
-| `REDIS_DATA_PATH` | `/runpod-volume/redis-data` | Network volume path |
-| `REDIS_ENABLE_PERSISTENCE` | `true` | Enable Redis persistence |
-| `REDIS_MAX_MEMORY` | `2gb` | Redis memory limit |
-
-### Cost Comparison
-
-| Mode | Pricing | Best For |
-|------|---------|----------|
-| Docker Pod | ~$0.29/hour (L4) | Steady traffic, always-on |
-| Serverless | ~$0.00024/second | Low traffic, pay-per-use |
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 infemeral/
-├── 📜 README.md                    # This file
-├── 📜 requirements.txt             # Server dependencies
-├── 📜 requirements.client.txt      # Client dependencies
-├── 📜 Dockerfile                   # Server container (gRPC)
-├── 📜 Dockerfile.serverless        # Serverless container (HTTP)
-├── 📜 Dockerfile.client            # Client container
-├── 📜 docker-compose.prod.yml      # Production deployment
-├── 📜 docker-compose.dev.yml       # Development setup
-├── 📜 runpod.toml                  # RunPod serverless config
+├── README.md                    # This file
+├── pyproject.toml               # Package configuration
+├── Dockerfile                   # Server container
 │
-├── 📂 proto/                       # gRPC Contract
-│   ├── inference.proto             # Service & message definitions
-│   └── build_proto.sh              # Stub generator script
+├── proto/                       # gRPC Contract
+│   ├── tensor_service.proto     # Service & message definitions
+│   └── build_proto.sh           # Stub generator script
 │
-├── 📂 client/                      # Sovereign Edge (Trusted)
-│   ├── main.py                     # CLI entry point
-│   ├── 📂 crypto/
-│   │   ├── matrix.py               # Orthogonal rotation (M, M⁻¹)
-│   │   ├── noise.py                # Differential privacy
-│   │   └── keys.py                 # RSA & AES key management
-│   ├── 📂 model/
-│   │   ├── tokenizer.py            # HuggingFace tokenizer wrapper
-│   │   └── embedder.py             # Embedding & LM head layers
-│   └── 📂 transport/
-│       ├── grpc_client.py          # gRPC client (traditional)
-│       └── http_client.py          # HTTP client (serverless)
+├── infemeral/                   # Core Package
+│   ├── __init__.py
+│   ├── client.py                # Client: embeddings, generation, gRPC
+│   ├── server.py                # Server: transformer forward, KV cache
+│   ├── config.py                # Pydantic settings (client & server)
+│   ├── crypto.py                # AES-256-GCM encryption
+│   ├── tensors.py               # Tensor serialization & compression
+│   ├── model_prep.py            # Model download & weight extraction
+│   └── tensor_service_pb2*.py   # Generated gRPC stubs
 │
-├── 📂 server/                      # Blind Core (Untrusted)
-│   ├── service.py                  # gRPC server implementation
-│   ├── handler.py                  # RunPod serverless handler
-│   ├── http_models.py              # HTTP request/response models
-│   ├── 📂 engine/
-│   │   ├── vllm_worker.py          # vLLM inference wrapper
-│   │   └── model_loader.py         # Headless model loading
-│   ├── 📂 state/
-│   │   ├── redis_connector.py      # Redis KV storage
-│   │   └── encryption.py           # KV cache encryption
-│   └── 📂 scripts/
-│       └── start_redis.sh          # Redis startup for serverless
+├── scripts/                     # Utilities
+│   └── benchmark_client.py      # Performance benchmarking
 │
-└── 📂 scripts/                     # Utilities
-    ├── generate_keys.py            # Key generation
-    ├── extract_embeddings.py       # Weight extraction
-    └── benchmark.py                # Performance testing
+└── tests/                       # Test Suite
+    ├── conftest.py              # Pytest fixtures
+    ├── test_client.py           # Client unit tests
+    ├── test_server.py           # Server unit tests
+    ├── test_crypto.py           # Encryption tests
+    ├── test_tensors.py          # Serialization tests
+    ├── test_config.py           # Configuration tests
+    ├── test_e2e.py              # End-to-end integration
+    ├── test_multi_turn.py       # Multi-turn conversation tests
+    └── test_client_perf.py      # Performance regression tests
 ```
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-### Client Configuration
+### Environment Variables
 
-```python
-from client import InfemerSession
-
-# Traditional gRPC deployment
-session = InfemerSession(
-    server_host="localhost",
-    server_port=50051,
-    model_name="meta-llama/Llama-3.1-8B-Instruct",
-    embedding_dim=4096,
-    privacy_epsilon=2.0,      # Lower = more private, more noise
-    privacy_delta=1e-5,
-    use_tls=True,
-    key_dir=Path("~/.infemeral/keys"),
-    transport="grpc",         # Use gRPC transport
-)
-
-# RunPod Serverless deployment
-session = InfemerSession(
-    model_name="meta-llama/Llama-3.1-8B-Instruct",
-    embedding_dim=4096,
-    privacy_epsilon=2.0,
-    key_dir=Path("~/.infemeral/keys"),
-    transport="http",                           # Use HTTP transport
-    runpod_api_key="your_runpod_api_key",
-    runpod_endpoint_id="your_endpoint_id",
-)
-```
-
-### Server Environment Variables
+**Client Configuration:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_NAME` | `meta-llama/Llama-3.1-8B-Instruct` | Model to load |
-| `HF_TOKEN` | - | HuggingFace API token |
-| `REDIS_HOST` | `redis-sidecar` | Redis hostname |
-| `REDIS_PORT` | `6379` | Redis port |
-| `GPU_MEMORY_UTILIZATION` | `0.85` | vLLM GPU memory fraction |
-| `MAX_MODEL_LEN` | `4096` | Maximum context length |
+| `INFEMERAL_CLIENT_WEIGHTS_PATH` | `/workspace/weights/client_weights.safetensors` | Path to client embedding weights |
+| `INFEMERAL_CLIENT_SERVER_URL` | `localhost:50051` | gRPC server endpoint |
+| `INFEMERAL_CLIENT_MODEL_ID` | `hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4` | Model for tokenizer |
 
-### Privacy Budget
+**Server Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFEMERAL_SERVER_WEIGHTS_DIR` | `/workspace/weights/model` | Full model directory |
+| `INFEMERAL_SERVER_TENSORIZED_WEIGHTS_PATH` | - | Optional Tensorizer cache path |
+| `INFEMERAL_SERVER_KV_CACHE_DIR` | `/workspace/weights/kv` | Session KV cache storage |
+| `INFEMERAL_SERVER_MAX_CONTEXT_LENGTH` | `2048` | Maximum context tokens |
+| `INFEMERAL_SERVER_ATTENTION_SINK_TOKENS` | `4` | Preserved tokens in context windowing |
+| `INFEMERAL_SERVER_GRPC_PORT` | `50051` | gRPC server port |
+
+### Python Configuration
 
 ```python
-# Adjust privacy/utility tradeoff
-privacy_epsilon = 2.0   # Standard: balanced privacy
-privacy_epsilon = 1.0   # High privacy: more noise, less accuracy
-privacy_epsilon = 4.0   # Low privacy: less noise, better accuracy
+from infemeral.config import client_settings, server_settings
+
+# Access settings
+print(client_settings.model_id)
+print(server_settings.max_context_length)
 ```
 
 ---
 
-## 📊 Performance
+## API Reference
 
-### Benchmarks (Llama 3.1 8B on L4 24GB)
+### Client
+
+```python
+from infemeral.client import Client, GenerationMetrics
+
+# Initialize
+client = Client(
+    weights_path="./weights/client_weights.safetensors",
+    server_url="localhost:50051",
+    device="cuda"  # or "cpu"
+)
+
+# Generate text
+output = client.generate(
+    prompt="Hello, world!",
+    max_new_tokens=100,      # Maximum tokens to generate
+    temperature=0.7,         # Sampling temperature (0 = greedy)
+    top_p=0.9               # Nucleus sampling threshold
+)
+
+# Generate with metrics
+output, metrics = client.generate(prompt, return_metrics=True)
+# metrics.tokens_per_second, metrics.time_to_first_token_ms, etc.
+
+# Health check
+is_healthy = client.check_channel_health()
+
+# Force reconnection
+client.reconnect()
+
+# Cleanup
+client.close()
+```
+
+### Server
+
+```python
+from infemeral.server import serve_grpc, handler
+
+# Start gRPC server
+serve_grpc(port=50051, max_workers=4)
+
+# RunPod serverless handler
+result = handler({"input": {...}})
+```
+
+### Model Preparation
+
+```python
+from infemeral.model_prep import (
+    download_model,
+    extract_client_weights,
+    tensorize_model,
+    prepare_model
+)
+
+# Full pipeline
+prepare_model(
+    model_id="hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+    output_dir="./weights",
+    tensorize=True
+)
+
+# Individual steps
+download_model(model_id, output_dir)
+extract_client_weights(model_dir, output_path)
+tensorize_model(model_dir, output_path)
+```
+
+### Cryptography
+
+```python
+from infemeral.crypto import generate_session_key, encrypt_bytes, decrypt_bytes
+
+# Generate 256-bit AES key
+key = generate_session_key()
+
+# Encrypt
+ciphertext, nonce = encrypt_bytes(plaintext, key)
+
+# Decrypt
+plaintext = decrypt_bytes(ciphertext, key, nonce)
+```
+
+---
+
+## Performance
+
+### Benchmarks (Llama 3.1 8B AWQ on L4 24GB)
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 45 tokens/sec |
-| **TTFT (Time to First Token)** | 180ms |
-| **Matrix Rotation Overhead** | 2.3ms |
-| **DP Noise Overhead** | 0.8ms |
-| **gRPC Serialization** | 5.2ms (512 tokens) |
-| **Total Privacy Overhead** | ~8ms/request |
+| **Throughput** | ~45 tokens/sec |
+| **TTFT (Time to First Token)** | ~180ms |
+| **Privacy Overhead** | ~8ms/request |
+| **Rotation + DP Noise** | ~3ms |
+| **Serialization** | ~5ms |
 
 ### Memory Usage
 
@@ -340,16 +386,28 @@ privacy_epsilon = 4.0   # Low privacy: less noise, better accuracy
 |-----------|--------|
 | Rotation Matrix (4096²) | 64 MB |
 | KV Cache (2048 tokens) | 512 MB |
-| Embedding Weights | 1.5 GB |
+| Client Embedding Weights | ~1.5 GB |
 
-Run benchmarks:
+### Run Benchmarks
+
 ```bash
-python scripts/benchmark.py --dim 4096 --seq-len 512
+python scripts/benchmark_client.py \
+    --weights ./weights/client_weights.safetensors \
+    --server localhost:50051 \
+    --tokens 20 \
+    --warmup 2 \
+    --runs 5 \
+    --device both \
+    --check-regression
 ```
+
+**Regression Baselines:**
+- CPU p50: 25ms (flagged if > 30ms)
+- GPU p50: 5ms (flagged if > 6ms)
 
 ---
 
-## 🔬 Technical Deep Dive
+## Technical Deep Dive
 
 ### Orthogonal Matrix Rotation
 
@@ -368,97 +426,133 @@ x_cloaked = (x + noise) @ M.T             # Rotate embedding
 x_output = x_cloaked_output @ M           # Inverse rotation
 ```
 
-### Differential Privacy
+### Context Windowing
 
-Gaussian mechanism calibrated for Local DP:
-
-```
-σ = Δf · √(2ln(1.25/δ)) / ε
-
-Where:
-- Δf = L2 sensitivity (bounded by embedding norm)
-- ε = privacy budget (lower = more private)
-- δ = privacy failure probability
-```
-
-### Tide-Windowing
-
-Context compression for long conversations:
+For long conversations, the server uses attention sinks with a sliding window:
 
 ```
 [Attention Sinks (4 tokens)] + [Recent Context (2044 tokens)]
      ↓ preserved                    ↓ sliding window
 ```
 
+This preserves model coherence while bounding memory usage.
+
+### KV Cache Format
+
+The system uses a versioned binary format (v2) for KV cache serialization:
+- Per-layer key/value tensor storage
+- LZ4 compression for tensors > 4KB
+- Backward compatibility with v1 format
+
 ---
 
-## 🛡️ Threat Model
+## Threat Model
 
 ### Adversary Capabilities
 
 We assume the server operator:
 - Has full access to server code and memory
-- Can observe all network traffic (encrypted)
+- Can observe all network traffic
 - Can modify server behavior (but client detects tampering)
-- Can collude with Redis provider
+- Can access storage layer
 
 ### Mitigations
 
 | Threat | Mitigation |
 |--------|------------|
 | **Embedding reconstruction** | Orthogonal rotation + DP noise |
-| **Known-plaintext attack** | Differential privacy (ε, δ) |
-| **Session correlation** | Fresh rotation per session |
+| **Known-plaintext attack** | Differential privacy |
 | **KV cache snooping** | AES-256-GCM encryption |
-| **Key compromise** | Forward secrecy via rotation |
 | **Model extraction** | Client holds embedding layers |
 
 ---
 
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Development Setup
+## Testing
 
 ```bash
-# Clone repo
-git clone https://github.com/infemeral/infemeral.git
-cd infemeral
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dev dependencies
-pip install -r requirements.txt -r requirements.client.txt
-pip install pytest black mypy
-
-# Run tests
+# Run all tests
 pytest tests/
 
-# Format code
-black client/ server/ scripts/
+# Run specific test categories
+pytest tests/ -m "not slow"           # Skip slow tests
+pytest tests/ -m "not gpu"            # Skip GPU tests
+pytest tests/ -m "not integration"    # Skip integration tests
+
+# Run with coverage
+pytest tests/ --cov=infemeral
 ```
 
 ---
 
-## 📜 License
+## Dependencies
+
+**Core:**
+- torch >= 2.4.0
+- transformers >= 4.44.0
+- safetensors >= 0.4.0
+- grpcio >= 1.66.0
+- protobuf >= 5.27.0
+
+**Security:**
+- cryptography >= 42.0.0
+- scipy >= 1.14.0
+
+**Configuration:**
+- pydantic >= 2.8.0
+- pydantic-settings >= 2.4.0
+
+**Performance:**
+- tensorizer >= 2.9.0 (optional, for fast model loading)
+- lz4 >= 4.3.0
+
+**Deployment:**
+- runpod >= 1.7.0
+- autoawq >= 0.2.9
+
+---
+
+## Contributing
+
+We welcome contributions!
+
+### Development Setup
+
+```bash
+git clone https://github.com/infemeral/infemeral.git
+cd infemeral
+
+python -m venv venv
+source venv/bin/activate
+
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/
+
+# Type checking
+mypy infemeral/
+
+# Format code
+black infemeral/ tests/ scripts/
+```
+
+---
+
+## License
 
 MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- [vLLM](https://github.com/vllm-project/vllm) - High-throughput inference
-- [LMCache](https://github.com/LMCache/LMCache) - KV cache management
-- [PySyft](https://github.com/OpenMined/PySyft) - Privacy-preserving ML inspiration
+- [Transformers](https://github.com/huggingface/transformers) - Model architecture
+- [Tensorizer](https://github.com/coreweave/tensorizer) - Fast model loading
 - [RunPod](https://runpod.io) - Serverless GPU infrastructure
+- [AutoAWQ](https://github.com/casper-hansen/AutoAWQ) - 4-bit quantization
 
 ---
 
 <p align="center">
-  <b>💠 Infemeral: Your thoughts, your control.</b>
+  <b>Infemeral: Your thoughts, your control.</b>
 </p>
-
