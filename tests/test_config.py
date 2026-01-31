@@ -7,45 +7,8 @@ import pytest
 
 from infemeral.config import (
     ClientSettings,
-    CryptoSettings,
     ServerSettings,
 )
-
-
-class TestCryptoSettings:
-    """Tests for cryptographic settings."""
-
-    def test_default_values(self):
-        """Check default cryptographic parameters."""
-        settings = CryptoSettings()
-
-        assert settings.hidden_dim == 4096
-        assert settings.dp_epsilon == 2.0
-        assert settings.dp_delta == 1e-5
-
-    def test_env_override(self):
-        """Environment variables should override defaults."""
-        with mock.patch.dict(
-            os.environ,
-            {
-                "INFEMERAL_CRYPTO_HIDDEN_DIM": "3072",
-                "INFEMERAL_CRYPTO_DP_EPSILON": "1.0",
-                "INFEMERAL_CRYPTO_DP_DELTA": "1e-6",
-            },
-        ):
-            settings = CryptoSettings()
-
-            assert settings.hidden_dim == 3072
-            assert settings.dp_epsilon == 1.0
-            assert settings.dp_delta == 1e-6
-
-    def test_dp_parameters_valid_range(self):
-        """DP parameters should be positive."""
-        settings = CryptoSettings()
-
-        assert settings.dp_epsilon > 0
-        assert settings.dp_delta > 0
-        assert settings.dp_delta < 1  # delta should be small
 
 
 class TestClientSettings:
@@ -127,23 +90,12 @@ class TestServerSettings:
 class TestSettingsInteraction:
     """Tests for settings interactions between modules."""
 
-    def test_hidden_dim_consistency(self):
-        """Hidden dim should match model architecture."""
-        crypto = CryptoSettings()
-        client = ClientSettings()
-
-        # Llama-3.1-8B has hidden_dim=4096
-        if "Llama-3.1-8B" in client.model_id:
-            assert crypto.hidden_dim == 4096
-
     def test_singleton_instances_exist(self):
         """Singleton instances should be importable."""
         from infemeral.config import (
             client_settings,
-            crypto_settings,
             server_settings,
         )
 
-        assert crypto_settings is not None
         assert client_settings is not None
         assert server_settings is not None
