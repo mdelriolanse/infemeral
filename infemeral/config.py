@@ -4,16 +4,6 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class CryptoSettings(BaseSettings):
-    """Cryptographic parameters."""
-
-    model_config = SettingsConfigDict(env_prefix="INFEMERAL_CRYPTO_")
-
-    hidden_dim: int = Field(default=4096, description="Model hidden dimension (d)")
-    dp_epsilon: float = Field(default=2.0, description="Differential privacy epsilon")
-    dp_delta: float = Field(default=1e-5, description="Differential privacy delta")
-
-
 class ClientSettings(BaseSettings):
     """Client-side settings."""
 
@@ -62,6 +52,5 @@ class ServerSettings(BaseSettings):
 
 
 # Singleton instances for easy import
-crypto_settings = CryptoSettings()
 client_settings = ClientSettings()
 server_settings = ServerSettings()
