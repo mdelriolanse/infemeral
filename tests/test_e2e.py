@@ -11,12 +11,9 @@ import pytest
 import torch
 
 from infemeral.crypto import (
-    cloak,
-    create_cloaking_context,
     decrypt_bytes,
     encrypt_bytes,
     generate_session_key,
-    uncloak,
 )
 from infemeral.tensors import deserialize_tensor, serialize_tensor
 
@@ -25,70 +22,47 @@ class TestFullInferenceFlow:
     """Tests for complete inference flow."""
 
     @pytest.fixture
-    def cloaking_ctx(self):
-        """Create cloaking context."""
-        return create_cloaking_context(seed=42)
-
-    @pytest.fixture
     def session_key(self):
         """Generate session key."""
         return generate_session_key()
 
-    def test_full_flow_preserves_shape(self, cloaking_ctx, session_key):
+    def test_full_flow_preserves_shape(self, session_key):
         """Full flow should preserve tensor shape."""
         # Original hidden states (from client embedding)
         hidden = torch.randn(1, 10, 4096, dtype=torch.float16)
 
-        # Step 1: Client - Cloak
-        cloaked = cloak(hidden.float(), cloaking_ctx, add_noise=False).half()
+        # Step 1: Client - Serialize
+        data, shape, dtype = serialize_tensor(hidden)
 
-        # Step 2: Client - Serialize
-        data, shape, dtype = serialize_tensor(cloaked)
-
-        # Step 3: Client - Encrypt
+        # Step 2: Client - Encrypt
         ciphertext, nonce = encrypt_bytes(data, session_key)
 
-        # Step 4: Server - Decrypt
+        # Step 3: Server - Decrypt
         plaintext = decrypt_bytes(ciphertext, session_key, nonce)
 
-        # Step 5: Server - Deserialize
+        # Step 4: Server - Deserialize
         server_input = deserialize_tensor(plaintext, shape, dtype, device="cpu")
 
-        # Step 6: Server - Transform (identity for test)
+        # Step 5: Server - Transform (identity for test)
         server_output = server_input  # In reality: forward_transformer()
 
-        # Step 7: Server - Serialize
+        # Step 6: Server - Serialize
         out_data, out_shape, out_dtype = serialize_tensor(server_output)
 
-        # Step 8: Server - Encrypt
+        # Step 7: Server - Encrypt
         out_ciphertext, out_nonce = encrypt_bytes(out_data, session_key)
 
-        # Step 9: Client - Decrypt
+        # Step 8: Client - Decrypt
         out_plaintext = decrypt_bytes(out_ciphertext, session_key, out_nonce)
 
-        # Step 10: Client - Deserialize
+        # Step 9: Client - Deserialize
         client_output = deserialize_tensor(out_plaintext, out_shape, out_dtype, "cpu")
 
-        # Step 11: Client - Uncloak
-        uncloaked = uncloak(client_output.float(), cloaking_ctx).half()
-
         # Verify shape preserved
-        assert uncloaked.shape == hidden.shape
+        assert client_output.shape == hidden.shape
 
-    def test_cloaking_preserves_information(self, cloaking_ctx, session_key):
-        """Cloaking should be reversible (without noise)."""
-        hidden = torch.randn(1, 10, 4096, dtype=torch.float32)
-
-        # Cloak without noise
-        cloaked = cloak(hidden, cloaking_ctx, add_noise=False)
-
-        # Simulate server pass-through
-        server_output = cloaked.clone()
-
-        # Uncloak
-        recovered = uncloak(server_output, cloaking_ctx)
-
-        torch.testing.assert_close(hidden, recovered, rtol=1e-4, atol=1e-4)
+        # Verify values preserved (identity transform)
+        torch.testing.assert_close(client_output, hidden)
 
     def test_encryption_protects_data(self, session_key):
         """Encryption should protect tensor data."""
@@ -110,82 +84,31 @@ class TestFullInferenceFlow:
 class TestSecurityInvariants:
     """Tests verifying security properties of the system."""
 
-    def test_server_cannot_see_raw_tokens(self):
-        """Server should never receive raw token IDs."""
-        # This is an architectural test - verify the flow
-        # Server only receives cloaked hidden states, not tokens
-
-        tokens = torch.tensor([[1, 2, 3, 4, 5]])  # Raw tokens
-
-        # Client embeds (mocked)
-        hidden = torch.randn(1, 5, 4096)  # Embedded representation
-
-        # Client cloaks
-        ctx = create_cloaking_context(seed=42)
-        cloaked = cloak(hidden, ctx, add_noise=True)
-
-        # What server receives
-        server_input = cloaked
-
-        # Server cannot recover tokens from cloaked hidden states
-        # because:
-        # 1. Hidden states are rotated by unknown orthogonal matrix
-        # 2. DP noise is added
-        # 3. Server doesn't have the embedding matrix
-
-        # This is verified by the fact that cloaked looks nothing like hidden
-        assert not torch.allclose(server_input, hidden, rtol=0.1, atol=0.1)
-
-    def test_server_cannot_see_raw_output(self):
-        """Server should never produce readable output."""
-        # Server returns cloaked hidden states, not logits
-
-        ctx = create_cloaking_context(seed=42)
-
-        # What server outputs (cloaked)
-        server_output = torch.randn(1, 5, 4096)
-
-        # Client uncloaks
-        uncloaked = uncloak(server_output, ctx)
-
-        # Without the correct matrix, server cannot interpret output
-        wrong_ctx = create_cloaking_context(seed=123)
-        wrong_uncloak = uncloak(server_output, wrong_ctx)
-
-        # Should be completely different
-        assert not torch.allclose(uncloaked, wrong_uncloak, rtol=0.1, atol=0.1)
-
     def test_different_sessions_isolated(self):
-        """Different sessions should have different cloaking."""
+        """Different sessions should have different encryption keys."""
         hidden = torch.randn(1, 10, 4096)
+        data, shape, dtype = serialize_tensor(hidden)
 
-        ctx1 = create_cloaking_context(seed=1)
-        ctx2 = create_cloaking_context(seed=2)
+        key1 = generate_session_key()
+        key2 = generate_session_key()
 
-        cloaked1 = cloak(hidden, ctx1, add_noise=False)
-        cloaked2 = cloak(hidden, ctx2, add_noise=False)
+        # Encrypt with key1
+        ciphertext1, nonce1 = encrypt_bytes(data, key1)
 
-        # Same input, different sessions = different cloaking
-        assert not torch.allclose(cloaked1, cloaked2)
+        # Cannot decrypt with key2
+        with pytest.raises(Exception):
+            decrypt_bytes(ciphertext1, key2, nonce1)
 
-        # Cannot uncloak session1's data with session2's matrix
-        wrong_uncloaked = uncloak(cloaked1, ctx2)
-        assert not torch.allclose(hidden, wrong_uncloaked, rtol=0.1, atol=0.1)
+    def test_session_keys_unique(self):
+        """Each session should have unique keys."""
+        keys = [generate_session_key() for _ in range(100)]
+
+        # All keys should be unique
+        assert len(set(keys)) == 100
 
 
 class TestDataIntegrity:
     """Tests for data integrity through the pipeline."""
-
-    def test_multiple_rounds_stable(self):
-        """Multiple cloak/uncloak rounds should be stable."""
-        ctx = create_cloaking_context(seed=42)
-        hidden = torch.randn(1, 10, 4096)
-
-        for _ in range(5):
-            cloaked = cloak(hidden, ctx, add_noise=False)
-            recovered = uncloak(cloaked, ctx)
-
-            torch.testing.assert_close(hidden, recovered, rtol=1e-4, atol=1e-4)
 
     def test_serialization_preserves_values(self):
         """Serialization should exactly preserve tensor values."""
@@ -205,6 +128,21 @@ class TestDataIntegrity:
         recovered = decrypt_bytes(ciphertext, key, nonce)
 
         assert recovered == original
+
+    def test_full_roundtrip_exact(self):
+        """Full serialize -> encrypt -> decrypt -> deserialize should be exact."""
+        key = generate_session_key()
+        tensor = torch.randn(1, 10, 4096, dtype=torch.float16)
+
+        # Forward
+        data, shape, dtype = serialize_tensor(tensor)
+        ciphertext, nonce = encrypt_bytes(data, key)
+
+        # Backward
+        plaintext = decrypt_bytes(ciphertext, key, nonce)
+        recovered = deserialize_tensor(plaintext, shape, dtype, device="cpu")
+
+        torch.testing.assert_close(tensor, recovered)
 
 
 class TestErrorHandling:
@@ -240,22 +178,6 @@ class TestErrorHandling:
 class TestPerformanceCharacteristics:
     """Tests for performance-related characteristics."""
 
-    def test_cloaking_batch_efficient(self):
-        """Cloaking should work efficiently with batches."""
-        ctx = create_cloaking_context(seed=42)
-
-        # Single item
-        single = torch.randn(1, 100, 4096)
-        cloaked_single = cloak(single, ctx, add_noise=False)
-
-        # Batch
-        batch = torch.randn(8, 100, 4096)
-        cloaked_batch = cloak(batch, ctx, add_noise=False)
-
-        # Both should work
-        assert cloaked_single.shape == single.shape
-        assert cloaked_batch.shape == batch.shape
-
     def test_serialization_size_predictable(self):
         """Serialized size should be predictable from tensor shape."""
         shapes = [
@@ -271,61 +193,93 @@ class TestPerformanceCharacteristics:
             expected_size = tensor.numel() * 2  # float16 = 2 bytes
             assert len(data) == expected_size
 
+    def test_batch_handling(self):
+        """System should handle batched tensors."""
+        key = generate_session_key()
+
+        # Single item
+        single = torch.randn(1, 100, 4096, dtype=torch.float16)
+        single_data, single_shape, single_dtype = serialize_tensor(single)
+        single_cipher, single_nonce = encrypt_bytes(single_data, key)
+
+        # Batch
+        batch = torch.randn(8, 100, 4096, dtype=torch.float16)
+        batch_data, batch_shape, batch_dtype = serialize_tensor(batch)
+        batch_cipher, batch_nonce = encrypt_bytes(batch_data, key)
+
+        # Both should round-trip correctly
+        single_recovered = deserialize_tensor(
+            decrypt_bytes(single_cipher, key, single_nonce),
+            single_shape, single_dtype, device="cpu"
+        )
+        batch_recovered = deserialize_tensor(
+            decrypt_bytes(batch_cipher, key, batch_nonce),
+            batch_shape, batch_dtype, device="cpu"
+        )
+
+        torch.testing.assert_close(single, single_recovered)
+        torch.testing.assert_close(batch, batch_recovered)
+
 
 class TestEdgeCases:
     """Edge case tests for the complete system."""
 
     def test_single_token_inference(self):
         """System should handle single token inference."""
-        ctx = create_cloaking_context(seed=42)
         key = generate_session_key()
 
-        hidden = torch.randn(1, 1, 4096)  # Single token
+        hidden = torch.randn(1, 1, 4096, dtype=torch.float16)  # Single token
 
         # Full flow
-        cloaked = cloak(hidden, ctx, add_noise=False)
-        data, shape, dtype = serialize_tensor(cloaked)
+        data, shape, dtype = serialize_tensor(hidden)
         cipher, nonce = encrypt_bytes(data, key)
 
         plain = decrypt_bytes(cipher, key, nonce)
         recovered = deserialize_tensor(plain, shape, dtype, device="cpu")
-        uncloaked = uncloak(recovered, ctx)
 
-        torch.testing.assert_close(hidden, uncloaked, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(hidden, recovered)
 
     def test_long_sequence_inference(self):
         """System should handle long sequences."""
-        ctx = create_cloaking_context(seed=42)
         key = generate_session_key()
 
-        hidden = torch.randn(1, 2048, 4096)  # Full context
+        hidden = torch.randn(1, 2048, 4096, dtype=torch.float16)  # Full context
 
         # Full flow
-        cloaked = cloak(hidden, ctx, add_noise=False)
-        data, shape, dtype = serialize_tensor(cloaked)
+        data, shape, dtype = serialize_tensor(hidden)
         cipher, nonce = encrypt_bytes(data, key)
 
         plain = decrypt_bytes(cipher, key, nonce)
         recovered = deserialize_tensor(plain, shape, dtype, device="cpu")
-        uncloaked = uncloak(recovered, ctx)
 
-        torch.testing.assert_close(hidden, uncloaked, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(hidden, recovered)
 
-    def test_float16_precision_acceptable(self):
-        """Float16 precision loss should be acceptable."""
-        ctx = create_cloaking_context(seed=42)
+    def test_float16_precision(self):
+        """Float16 serialization should maintain precision."""
+        key = generate_session_key()
 
-        # Use float32 for cloaking (higher precision)
+        hidden = torch.randn(1, 10, 4096, dtype=torch.float16)
+
+        data, shape, dtype = serialize_tensor(hidden)
+        cipher, nonce = encrypt_bytes(data, key)
+
+        plain = decrypt_bytes(cipher, key, nonce)
+        recovered = deserialize_tensor(plain, shape, dtype, device="cpu")
+
+        # Should be exact for float16
+        torch.testing.assert_close(hidden, recovered)
+
+    def test_float32_precision(self):
+        """Float32 serialization should maintain precision."""
+        key = generate_session_key()
+
         hidden = torch.randn(1, 10, 4096, dtype=torch.float32)
 
-        cloaked = cloak(hidden, ctx, add_noise=False)
+        data, shape, dtype = serialize_tensor(hidden)
+        cipher, nonce = encrypt_bytes(data, key)
 
-        # Convert to float16 for transmission (as in real system)
-        cloaked_f16 = cloaked.half()
+        plain = decrypt_bytes(cipher, key, nonce)
+        recovered = deserialize_tensor(plain, shape, dtype, device="cpu")
 
-        # Convert back and uncloak
-        cloaked_f32 = cloaked_f16.float()
-        recovered = uncloak(cloaked_f32, ctx)
-
-        # Should be close despite precision loss
-        torch.testing.assert_close(hidden, recovered, rtol=1e-2, atol=1e-2)
+        # Should be exact for float32
+        torch.testing.assert_close(hidden, recovered)
