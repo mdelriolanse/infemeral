@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from infemeral.crypto import cloak, create_cloaking_context, uncloak
 from infemeral.tensors import (
     compress_tensor_data,
     decompress_tensor_data,
@@ -26,102 +25,8 @@ class TestGpuPath:
         client = Client(weights_path=mock_client_weights, device="cuda")
 
         assert client.embedding.embed_tokens.weight.device.type == "cuda"
-        assert client.cloaking_ctx.matrix.device.type == "cuda"
-        assert client.cloaking_ctx.device == "cuda"
 
         client.close()
-
-    def test_cloaking_matrix_on_target_device(self):
-        """Cloaking matrix should be created on target device."""
-        ctx = create_cloaking_context(seed=42, device="cpu", dtype=torch.float16)
-        assert ctx.matrix.device.type == "cpu"
-        assert ctx.matrix.dtype == torch.float16
-        assert ctx.device == "cpu"
-
-    @pytest.mark.gpu
-    def test_cloaking_matrix_on_gpu(self):
-        """Cloaking matrix should be created on GPU when specified."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        ctx = create_cloaking_context(seed=42, device="cuda", dtype=torch.float16)
-        assert ctx.matrix.device.type == "cuda"
-        assert ctx.matrix_t.device.type == "cuda"
-        assert ctx.device == "cuda"
-
-
-class TestNoDeviceTransfer:
-    """Tests to verify no unnecessary device transfers."""
-
-    def test_no_device_transfer_during_cloak_cpu(self):
-        """Cloak should not call .to() if matrix already on device."""
-        ctx = create_cloaking_context(seed=42, device="cpu", dtype=torch.float32)
-        hidden = torch.randn(1, 10, 4096, device="cpu", dtype=torch.float32)
-
-        # Matrix should already be on CPU with correct dtype
-        assert ctx.matrix.device == hidden.device
-        assert ctx.matrix.dtype == hidden.dtype
-
-        # Cloak should not transfer
-        cloaked = cloak(hidden, ctx, add_noise=False)
-        assert cloaked.device == hidden.device
-
-    @pytest.mark.gpu
-    def test_no_device_transfer_during_cloak_gpu(self):
-        """Cloak should not call .to() if matrix already on CUDA."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        ctx = create_cloaking_context(seed=42, device="cuda", dtype=torch.float16)
-        hidden = torch.randn(1, 10, 4096, device="cuda", dtype=torch.float16)
-
-        # Matrix should already be on CUDA with correct dtype
-        assert ctx.matrix.device == hidden.device
-        assert ctx.matrix.dtype == hidden.dtype
-
-        cloaked = cloak(hidden, ctx, add_noise=False)
-        assert cloaked.device.type == "cuda"
-
-
-class TestOrthogonalMatrixFloat16:
-    """Tests for float16 orthogonal matrix validity."""
-
-    def test_orthogonal_matrix_float16_valid(self):
-        """Float16 orthogonal matrix should satisfy M @ M.T ≈ I."""
-        ctx = create_cloaking_context(seed=42, device="cpu", dtype=torch.float16)
-
-        # Upcast to float32 for precision during verification
-        M = ctx.matrix.float()
-        I = torch.eye(M.shape[0])
-
-        # Relaxed tolerance for float16
-        result = M @ M.T
-        assert torch.allclose(result, I, atol=1e-3), (
-            f"Orthogonality check failed. Max deviation: {(result - I).abs().max()}"
-        )
-
-    def test_orthogonal_matrix_float32_valid(self):
-        """Float32 orthogonal matrix should satisfy M @ M.T ≈ I."""
-        ctx = create_cloaking_context(seed=42, device="cpu", dtype=torch.float32)
-
-        M = ctx.matrix
-        I = torch.eye(M.shape[0])
-
-        result = M @ M.T
-        assert torch.allclose(result, I, atol=1e-5), (
-            f"Orthogonality check failed. Max deviation: {(result - I).abs().max()}"
-        )
-
-    def test_cloak_uncloak_roundtrip_float16(self):
-        """Cloak -> Uncloak should approximately recover original (float16)."""
-        ctx = create_cloaking_context(seed=42, device="cpu", dtype=torch.float16)
-        hidden = torch.randn(1, 10, 4096, dtype=torch.float16)
-
-        cloaked = cloak(hidden, ctx, add_noise=False)
-        recovered = uncloak(cloaked, ctx)
-
-        # Relaxed tolerance for float16
-        assert torch.allclose(hidden, recovered, rtol=1e-3, atol=1e-3)
 
 
 class TestTiedEmbeddings:
@@ -258,9 +163,7 @@ class TestGenerationMetrics:
         timing = TokenTiming()
 
         assert hasattr(timing, "embed_ms")
-        assert hasattr(timing, "cloak_ms")
         assert hasattr(timing, "network_ms")
-        assert hasattr(timing, "uncloak_ms")
         assert hasattr(timing, "de_embed_ms")
         assert hasattr(timing, "sample_ms")
         assert hasattr(timing, "total_ms")
