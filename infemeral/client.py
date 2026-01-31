@@ -1,4 +1,4 @@
-"""Client-side inference: embedding, cloaking, and de-embedding.
+"""Client-side inference: embedding and de-embedding.
 
 The client holds the semantic entry and exit points (embed_tokens + lm_head),
 ensuring the server never sees raw tokens or human-readable outputs.
@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from infemeral.config import client_settings, crypto_settings
+from infemeral.config import client_settings
 
 
 @dataclass
@@ -23,9 +23,7 @@ class TokenTiming:
     """Timing breakdown for a single token generation."""
 
     embed_ms: float = 0.0
-    cloak_ms: float = 0.0
     network_ms: float = 0.0
-    uncloak_ms: float = 0.0
     de_embed_ms: float = 0.0
     sample_ms: float = 0.0
     total_ms: float = 0.0
@@ -44,12 +42,9 @@ class GenerationMetrics:
 
 
 from infemeral.crypto import (
-    cloak,
-    create_cloaking_context,
     decrypt_bytes,
     encrypt_bytes,
     generate_session_key,
-    uncloak,
 )
 from infemeral.tensors import deserialize_tensor, serialize_tensor
 
@@ -115,8 +110,7 @@ class Client:
 
     Security invariants:
     1. Raw tokens never leave the client
-    2. Raw embeddings never leave the client
-    3. Server only sees cloaked (rotated + noised) hidden states
+    2. Server only sees encrypted hidden states
     """
 
     def __init__(
@@ -146,12 +140,6 @@ class Client:
         # Session state
         self.session_id = secrets.token_hex(16)
         self.session_key = generate_session_key()
-        # Create cloaking context on target device with float16 for memory efficiency
-        self.cloaking_ctx = create_cloaking_context(
-            seed=secrets.randbelow(2**31),
-            device=device,
-            dtype=torch.float16,
-        )
 
         # gRPC channel (lazy init)
         self._channel: grpc.Channel | None = None
@@ -202,15 +190,15 @@ class Client:
         self.close()
         _ = self.stub
 
-    def _call_server(self, cloaked: torch.Tensor) -> torch.Tensor:
-        """Send cloaked embedding to server, receive transformed output."""
+    def _call_server(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Send hidden states to server, receive transformed output."""
         # Serialize tensor
-        data, shape, dtype = serialize_tensor(cloaked)
+        data, shape, dtype = serialize_tensor(hidden)
 
         # Encrypt with session key
         encrypted_data, nonce = encrypt_bytes(data, self.session_key)
 
-        # Build request
+        # Build request (field name kept for protobuf compatibility)
         request = tensor_service_pb2.InferenceRequest(
             cloaked_embedding=encrypted_data,
             encrypted_session_key=self.session_key,  # TODO: RSA-wrap this
@@ -283,20 +271,16 @@ class Client:
         )
         if return_metrics and timing:
             metrics.timings.append(timing[1])
-            hidden, cloaked, server_output, uncloaked, logits, next_token = (
+            hidden, server_output, logits, next_token = (
                 timing[0]["hidden"],
-                timing[0]["cloaked"],
                 timing[0]["server_output"],
-                timing[0]["uncloaked"],
                 timing[0]["logits"],
                 timing[0]["next_token"],
             )
         else:
             hidden = self.embedding.embed(generated_ids)
-            cloaked = cloak(hidden, self.cloaking_ctx)
-            server_output = self._call_server(cloaked)
-            uncloaked = uncloak(server_output, self.cloaking_ctx)
-            logits = self.embedding.de_embed(uncloaked[:, -1:, :])
+            server_output = self._call_server(hidden)
+            logits = self.embedding.de_embed(server_output[:, -1:, :])
             next_token = self._sample(logits[:, -1, :], temperature, top_p)
 
         if next_token.item() == self.tokenizer.eos_token_id:
@@ -320,10 +304,8 @@ class Client:
                 next_token = timing[0]["next_token"]
             else:
                 hidden = self.embedding.embed(last_token)
-                cloaked = cloak(hidden, self.cloaking_ctx)
-                server_output = self._call_server(cloaked)
-                uncloaked = uncloak(server_output, self.cloaking_ctx)
-                logits = self.embedding.de_embed(uncloaked[:, -1:, :])
+                server_output = self._call_server(hidden)
+                logits = self.embedding.de_embed(server_output[:, -1:, :])
                 next_token = self._sample(logits[:, -1, :], temperature, top_p)
 
             if next_token.item() == self.tokenizer.eos_token_id:
@@ -360,24 +342,14 @@ class Client:
         hidden = self.embedding.embed(input_ids)
         timing.embed_ms = (time.perf_counter() - t0) * 1000
 
-        # Cloak
-        t0 = time.perf_counter()
-        cloaked = cloak(hidden, self.cloaking_ctx)
-        timing.cloak_ms = (time.perf_counter() - t0) * 1000
-
         # Network (includes serialize + encrypt + RPC + decrypt + deserialize)
         t0 = time.perf_counter()
-        server_output = self._call_server(cloaked)
+        server_output = self._call_server(hidden)
         timing.network_ms = (time.perf_counter() - t0) * 1000
-
-        # Uncloak
-        t0 = time.perf_counter()
-        uncloaked = uncloak(server_output, self.cloaking_ctx)
-        timing.uncloak_ms = (time.perf_counter() - t0) * 1000
 
         # De-embed
         t0 = time.perf_counter()
-        logits = self.embedding.de_embed(uncloaked[:, -1:, :])
+        logits = self.embedding.de_embed(server_output[:, -1:, :])
         timing.de_embed_ms = (time.perf_counter() - t0) * 1000
 
         # Sample
@@ -389,9 +361,7 @@ class Client:
 
         intermediates = {
             "hidden": hidden,
-            "cloaked": cloaked,
             "server_output": server_output,
-            "uncloaked": uncloaked,
             "logits": logits,
             "next_token": next_token,
         }
@@ -470,7 +440,7 @@ def print_metrics(metrics: GenerationMetrics) -> None:
         print(f"{'Phase':<12} {'Min':>8} {'Median':>8} {'Max':>8} {'Total':>10}")
         print("-" * 48)
 
-        phases = ["embed", "cloak", "network", "uncloak", "de_embed", "sample", "total"]
+        phases = ["embed", "network", "de_embed", "sample", "total"]
         for phase in phases:
             values = [getattr(t, f"{phase}_ms") for t in metrics.timings]
             sorted_vals = sorted(values)
