@@ -13,6 +13,7 @@ import argparse
 import json
 import statistics
 import sys
+import traceback
 import tracemalloc
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -42,15 +43,9 @@ class BenchmarkResult:
     embed_p50: float
     embed_p95: float
     embed_p99: float
-    cloak_p50: float
-    cloak_p95: float
-    cloak_p99: float
     network_p50: float
     network_p95: float
     network_p99: float
-    uncloak_p50: float
-    uncloak_p95: float
-    uncloak_p99: float
     de_embed_p50: float
     de_embed_p95: float
     de_embed_p99: float
@@ -180,7 +175,7 @@ def benchmark_device(
         cpu_peak = max(cpu_memory_peaks) if cpu_memory_peaks else 0.0
 
         # Compute percentiles for each phase
-        phases = ["embed", "cloak", "network", "uncloak", "de_embed", "sample", "total"]
+        phases = ["embed", "network", "de_embed", "sample", "total"]
         percentiles_dict: dict[str, tuple[float, float, float]] = {}
         for phase in phases:
             percentiles_dict[phase] = compute_phase_percentiles(all_timings, phase)
@@ -196,15 +191,9 @@ def benchmark_device(
             embed_p50=percentiles_dict["embed"][0],
             embed_p95=percentiles_dict["embed"][1],
             embed_p99=percentiles_dict["embed"][2],
-            cloak_p50=percentiles_dict["cloak"][0],
-            cloak_p95=percentiles_dict["cloak"][1],
-            cloak_p99=percentiles_dict["cloak"][2],
             network_p50=percentiles_dict["network"][0],
             network_p95=percentiles_dict["network"][1],
             network_p99=percentiles_dict["network"][2],
-            uncloak_p50=percentiles_dict["uncloak"][0],
-            uncloak_p95=percentiles_dict["uncloak"][1],
-            uncloak_p99=percentiles_dict["uncloak"][2],
             de_embed_p50=percentiles_dict["de_embed"][0],
             de_embed_p95=percentiles_dict["de_embed"][1],
             de_embed_p99=percentiles_dict["de_embed"][2],
@@ -234,7 +223,7 @@ def print_result(result: BenchmarkResult) -> None:
 
     print(f"\n{'Phase':<12} {'p50':>10} {'p95':>10} {'p99':>10}")
     print("-" * 44)
-    for phase in ["embed", "cloak", "network", "uncloak", "de_embed", "sample", "total"]:
+    for phase in ["embed", "network", "de_embed", "sample", "total"]:
         p50 = getattr(result, f"{phase}_p50")
         p95 = getattr(result, f"{phase}_p95")
         p99 = getattr(result, f"{phase}_p99")
@@ -255,7 +244,7 @@ def print_comparison(cpu_result: BenchmarkResult | None, gpu_result: BenchmarkRe
 
     print(f"\n{'Phase':<12} {'CPU p50':>10} {'GPU p50':>10} {'Speedup':>10}")
     print("-" * 44)
-    for phase in ["embed", "cloak", "network", "uncloak", "de_embed", "sample", "total"]:
+    for phase in ["embed", "network", "de_embed", "sample", "total"]:
         cpu_p50 = getattr(cpu_result, f"{phase}_p50")
         gpu_p50 = getattr(gpu_result, f"{phase}_p50")
         phase_speedup = cpu_p50 / gpu_p50 if gpu_p50 > 0 else 0
