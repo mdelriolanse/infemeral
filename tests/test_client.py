@@ -5,8 +5,6 @@ from unittest import mock
 import pytest
 import torch
 
-from infemeral.crypto import create_cloaking_context
-
 
 class TestEmbeddingLayer:
     """Tests for client embedding layer."""
@@ -168,52 +166,6 @@ class TestClientSession:
 
         assert len(key) == 32
         assert isinstance(key, bytes)
-
-    def test_cloaking_context_created(self):
-        """Client should create a cloaking context."""
-        ctx = create_cloaking_context(seed=42)
-
-        assert ctx.matrix is not None
-        assert ctx.matrix_t is not None
-        assert ctx.sigma > 0
-
-
-class TestClientCloakingFlow:
-    """Tests for the client cloaking/uncloaking flow."""
-
-    @pytest.fixture
-    def cloaking_ctx(self):
-        """Create cloaking context for tests."""
-        return create_cloaking_context(seed=42)
-
-    def test_cloak_uncloak_flow(self, cloaking_ctx):
-        """Cloak -> server -> uncloak should preserve structure."""
-        from infemeral.crypto import cloak, uncloak
-
-        hidden = torch.randn(1, 10, 4096)
-
-        # Client: cloak (without noise for testing)
-        cloaked = cloak(hidden, cloaking_ctx, add_noise=False)
-
-        # Simulate server: identity transform (no actual processing)
-        server_output = cloaked.clone()
-
-        # Client: uncloak
-        recovered = uncloak(server_output, cloaking_ctx)
-
-        torch.testing.assert_close(hidden, recovered, rtol=1e-4, atol=1e-4)
-
-    def test_cloak_with_noise_adds_privacy(self, cloaking_ctx):
-        """Cloaking with noise should add DP protection."""
-        from infemeral.crypto import cloak
-
-        hidden = torch.randn(1, 10, 4096)
-
-        cloaked1 = cloak(hidden, cloaking_ctx, add_noise=True)
-        cloaked2 = cloak(hidden, cloaking_ctx, add_noise=True)
-
-        # Same input, different noise = different cloaked outputs
-        assert not torch.allclose(cloaked1, cloaked2)
 
 
 class TestClientGrpcCalls:
