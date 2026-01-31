@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from infemeral.crypto import create_cloaking_context, generate_session_key
+from infemeral.crypto import generate_session_key
 
 
 @pytest.fixture(scope="session")
@@ -20,12 +20,6 @@ def device():
 def session_key():
     """Generate a fresh session key."""
     return generate_session_key()
-
-
-@pytest.fixture
-def cloaking_context():
-    """Create a cloaking context with fixed seed for reproducibility."""
-    return create_cloaking_context(seed=42)
 
 
 @pytest.fixture
