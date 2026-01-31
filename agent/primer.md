@@ -1,6 +1,6 @@
 # Infemeral Agent Primer
 
-**Generated**: 2026-01-19_20-37-46
+**Generated**: 2026-01-31_15-21-19
 
 ## Tech Stack
 
@@ -167,34 +167,9 @@ ruff check .
 ruff format .
 ```
 
-## Current Development Notes
+---
 
-**Recent Work (2026-01)**:
-- **Two-phase generation**: Prompt phase sends full sequence, generation phase sends only new token (relies on server KV cache)
-- **Per-layer KV cache**: v2 binary format stores (key, value) tuples per transformer layer with proper shape validation
-- **Context windowing**: Attention sink (first N tokens) + sliding window to bound KV cache growth
-- **DynamicCache integration**: Server converts tuple-based cache to transformers `DynamicCache` for layer compatibility
-- **Performance instrumentation**: `TokenTiming` and `GenerationMetrics` classes for profiling per-token latency breakdown
-
-**Known Considerations**:
-- Rotary embeddings computed per-layer using each layer's `rotary_emb` module
-- Position IDs must account for `past_len` when KV cache exists
-- AWQ quantized models loaded via `AutoModelForCausalLM.from_pretrained` with `device_map`
-- Tensorizer path checked first for faster cold starts (~10x vs SafeTensors)
-
-## File Deployment
-
-After modifying server files, deploy to RunPod using:
-```bash
-./scp_to_runpod.sh <pod_ip> <port> <filename> [remote_target_dir]
-```
-
-Example:
-```bash
-./scp_to_runpod.sh 203.57.40.146 10017 infemeral/server.py
-```
-
-## RunPod Environment Setup
+## RunPod Environment Setup (CRITICAL REFERENCE)
 
 ### SSH Connection
 
@@ -304,24 +279,53 @@ ssh -p <port> root@<pod_ip> "rm -rf /workspace/weights/kv/*"
 
 ```bash
 # 1. Deploy updated code
-./scp_to_runpod.sh 203.57.40.146 10017 infemeral/server.py
+./scp_to_runpod.sh <pod_ip> <port> infemeral/server.py
 
 # 2. Restart server on RunPod
-ssh -p 10017 root@203.57.40.146 "pkill -9 python; sleep 2 && cd /workspace/infemeral-src && /mnt/.venv/bin/python -m infemeral.server > /tmp/server.log 2>&1 &"
+ssh -p <port> root@<pod_ip> "pkill -9 python; sleep 2 && cd /workspace/infemeral-src && /mnt/.venv/bin/python -m infemeral.server > /tmp/server.log 2>&1 &"
 
 # 3. Wait for model load (~20s)
 sleep 20
 
 # 4. Check server started
-ssh -p 10017 root@203.57.40.146 "tail -5 /tmp/server.log"
+ssh -p <port> root@<pod_ip> "tail -5 /tmp/server.log"
 # Should show: "gRPC server started on port 50051"
 
 # 5. Run client test
-ssh -p 10017 root@203.57.40.146 "cd /workspace/infemeral-src && timeout 180 /mnt/.venv/bin/python -c \"
+ssh -p <port> root@<pod_ip> "cd /workspace/infemeral-src && timeout 180 /mnt/.venv/bin/python -c \"
 from infemeral.client import Client
 client = Client(weights_path='/workspace/weights/client_weights.safetensors', device='cpu')
 result = client.generate('Hello', max_new_tokens=10)
 print(f'Result: {repr(result)}')
 client.close()
 \""
+```
+
+---
+
+## Current Development Notes
+
+**Recent Work (2026-01)**:
+- **Two-phase generation**: Prompt phase sends full sequence, generation phase sends only new token (relies on server KV cache)
+- **Per-layer KV cache**: v2 binary format stores (key, value) tuples per transformer layer with proper shape validation
+- **Context windowing**: Attention sink (first N tokens) + sliding window to bound KV cache growth
+- **DynamicCache integration**: Server converts tuple-based cache to transformers `DynamicCache` for layer compatibility
+- **Performance instrumentation**: `TokenTiming` and `GenerationMetrics` classes for profiling per-token latency breakdown
+
+**Known Considerations**:
+- Rotary embeddings computed per-layer using each layer's `rotary_emb` module
+- Position IDs must account for `past_len` when KV cache exists
+- AWQ quantized models loaded via `AutoModelForCausalLM.from_pretrained` with `device_map`
+- Tensorizer path checked first for faster cold starts (~10x vs SafeTensors)
+
+## File Deployment
+
+After modifying server files, deploy to RunPod using:
+```bash
+./scp_to_runpod.sh <pod_ip> <port> <filename> [remote_target_dir]
+```
+
+Example:
+```bash
+./scp_to_runpod.sh 203.57.40.146 10017 infemeral/server.py
 ```
