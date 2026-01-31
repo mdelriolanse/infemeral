@@ -1,6 +1,6 @@
-"""Server-side inference: transformer blocks on cloaked hidden states.
+"""Server-side inference: transformer blocks on encrypted hidden states.
 
-The server processes cloaked embeddings through transformer layers,
+The server processes encrypted hidden states through transformer layers,
 never seeing raw tokens or being able to reconstruct user intent.
 
 Uses Tensorizer for fast model loading with AWQ quantization support.
@@ -528,7 +528,7 @@ class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
         """Process a single inference request.
 
         Args:
-            request: InferenceRequest with cloaked embedding and session data
+            request: InferenceRequest with encrypted hidden states and session data
             context: gRPC context for setting status codes
 
         Returns:
@@ -538,25 +538,25 @@ class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
             # Extract fields from request
             session_key = bytes(request.encrypted_session_key)
             nonce = bytes(request.nonce)
-            cloaked_data = bytes(request.cloaked_embedding)
+            encrypted_data = bytes(request.cloaked_embedding)
             shape = list(request.shape)
             dtype = request.dtype
             session_id = request.session_id
 
             logger.info(f"Processing inference request for session {session_id[:8]}...")
 
-            # Decrypt cloaked embedding
-            plaintext = decrypt_bytes(cloaked_data, session_key, nonce)
+            # Decrypt hidden states
+            plaintext = decrypt_bytes(encrypted_data, session_key, nonce)
 
             # Deserialize tensor
-            cloaked = deserialize_tensor(plaintext, shape, dtype, device=self.device)
+            hidden = deserialize_tensor(plaintext, shape, dtype, device=self.device)
 
             # Load KV cache if exists
             past_key_values = load_kv_cache(session_id, session_key, self.device)
 
             # Forward through transformer
             with torch.no_grad():
-                output, new_kv = forward_transformer(self.model, cloaked, past_key_values)
+                output, new_kv = forward_transformer(self.model, hidden, past_key_values)
 
             # Save updated KV cache
             if new_kv:
@@ -569,7 +569,7 @@ class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
             encrypted_output, output_nonce = encrypt_bytes(output_data, session_key)
 
             # Memory wipe
-            del cloaked, output, new_kv
+            del hidden, output, new_kv
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -655,7 +655,7 @@ def serve_grpc(port: int | None = None, max_workers: int = 4) -> None:
 def handler(event: dict) -> dict:
     """RunPod serverless handler.
 
-    Receives cloaked embeddings, runs transformer inference,
+    Receives encrypted hidden states, runs transformer inference,
     returns transformed hidden states.
 
     Input event:
@@ -697,15 +697,15 @@ def handler(event: dict) -> dict:
             import base64
             nonce = base64.b64decode(nonce)
 
-        cloaked_data = inp["cloaked_embedding"]
-        if isinstance(cloaked_data, str):
+        encrypted_data = inp["cloaked_embedding"]
+        if isinstance(encrypted_data, str):
             import base64
-            cloaked_data = base64.b64decode(cloaked_data)
+            encrypted_data = base64.b64decode(encrypted_data)
 
-        plaintext = decrypt_bytes(cloaked_data, session_key, nonce)
+        plaintext = decrypt_bytes(encrypted_data, session_key, nonce)
 
         # Deserialize tensor
-        cloaked = deserialize_tensor(
+        hidden = deserialize_tensor(
             plaintext,
             inp["shape"],
             inp["dtype"],
@@ -719,7 +719,7 @@ def handler(event: dict) -> dict:
 
         # Forward through transformer
         with torch.no_grad():
-            output, new_kv = forward_transformer(model, cloaked, past_key_values)
+            output, new_kv = forward_transformer(model, hidden, past_key_values)
 
         # Save updated KV cache
         if new_kv:
@@ -732,7 +732,7 @@ def handler(event: dict) -> dict:
         encrypted_output, output_nonce = encrypt_bytes(output_data, session_key)
 
         # Memory wipe
-        del cloaked, output, new_kv
+        del hidden, output, new_kv
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
