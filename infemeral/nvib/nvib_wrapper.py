@@ -146,6 +146,10 @@ class NVIBCloaker:
             self._lib.nvib_cloak_set_beta(self._ctx, ctypes.c_float(beta))
             self.beta = beta
 
+        # Store original device and move to CPU for C library processing
+        original_device = embedding.device
+        embedding = embedding.cpu()
+
         # Ensure contiguous float32 tensor
         if embedding.dtype != torch.float32:
             embedding = embedding.float()
@@ -156,7 +160,7 @@ class NVIBCloaker:
         flat_embedding = embedding.view(-1, self.dim)
         batch_size = flat_embedding.shape[0]
 
-        # Prepare output tensor
+        # Prepare output tensor (on CPU)
         output = torch.empty_like(flat_embedding)
 
         # Process each embedding in batch
@@ -182,8 +186,8 @@ class NVIBCloaker:
             self._lib.nvib_cloak_set_beta(self._ctx, ctypes.c_float(old_beta))
             self.beta = old_beta
 
-        # Reshape to original shape
-        return output.view(original_shape)
+        # Reshape to original shape and move back to original device
+        return output.view(original_shape).to(original_device)
 
     def set_seed(self, seed: int):
         """Set PRNG seed for deterministic behavior.
