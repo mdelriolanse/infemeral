@@ -12,10 +12,24 @@ from pathlib import Path
 import grpc
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 from transformers import AutoTokenizer
 
 from infemeral.config import client_settings
+from infemeral.crypto import (
+    decrypt_bytes,
+    encrypt_bytes,
+    generate_session_key,
+)
+from infemeral.tensors import deserialize_tensor, serialize_tensor
+
+# NVIB cloaking (optional privacy layer)
+try:
+    from infemeral.nvib import NVIBCloaker
+    HAS_NVIB = True
+except (ImportError, RuntimeError):
+    HAS_NVIB = False
+    NVIBCloaker = None
 
 
 @dataclass
@@ -23,6 +37,7 @@ class TokenTiming:
     """Timing breakdown for a single token generation."""
 
     embed_ms: float = 0.0
+    nvib_ms: float = 0.0
     network_ms: float = 0.0
     de_embed_ms: float = 0.0
     sample_ms: float = 0.0
@@ -39,14 +54,6 @@ class GenerationMetrics:
     tokens_per_sec: float = 0.0
     total_tokens: int = 0
     prompt_tokens: int = 0
-
-
-from infemeral.crypto import (
-    decrypt_bytes,
-    encrypt_bytes,
-    generate_session_key,
-)
-from infemeral.tensors import deserialize_tensor, serialize_tensor
 
 # Import generated protobuf (will be generated from tensor_service.proto)
 try:
@@ -146,6 +153,22 @@ class Client:
         self._stub = None
         self.server_url = server_url
 
+        # Initialize NVIB cloaker (optional privacy layer)
+        self.nvib_cloaker = None
+        if HAS_NVIB:
+            try:
+                from infemeral.config import nvib_settings
+                self.nvib_cloaker = NVIBCloaker(
+                    dim=nvib_settings.dim,
+                    beta=nvib_settings.beta,
+                    mu_init=nvib_settings.mu_init,
+                    log_sigma2_init=nvib_settings.log_sigma2_init,
+                    seed=nvib_settings.prng_seed,
+                )
+            except Exception as e:
+                import warnings
+                warnings.warn(f"NVIB cloaking unavailable: {e}. Continuing without NVIB.")
+
     @property
     def stub(self):
         """Lazy-initialize gRPC stub with keepalive."""
@@ -190,8 +213,8 @@ class Client:
         self.close()
         _ = self.stub
 
-    def _call_server(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Send hidden states to server, receive transformed output."""
+    def _call_server_internal(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Send hidden states to server (no NVIB - already applied)."""
         # Serialize tensor
         data, shape, dtype = serialize_tensor(hidden)
 
@@ -229,6 +252,13 @@ class Client:
             response.dtype,
             device=self.device,
         )
+
+    def _call_server(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Send hidden states to server, receive transformed output."""
+        # Apply NVIB cloaking if available
+        if self.nvib_cloaker is not None:
+            hidden = self.nvib_cloaker.cloak(hidden)
+        return self._call_server_internal(hidden)
 
     def generate(
         self,
@@ -342,9 +372,15 @@ class Client:
         hidden = self.embedding.embed(input_ids)
         timing.embed_ms = (time.perf_counter() - t0) * 1000
 
+        # NVIB cloaking (if available)
+        if self.nvib_cloaker is not None:
+            t0 = time.perf_counter()
+            hidden = self.nvib_cloaker.cloak(hidden)
+            timing.nvib_ms = (time.perf_counter() - t0) * 1000
+
         # Network (includes serialize + encrypt + RPC + decrypt + deserialize)
         t0 = time.perf_counter()
-        server_output = self._call_server(hidden)
+        server_output = self._call_server_internal(hidden)
         timing.network_ms = (time.perf_counter() - t0) * 1000
 
         # De-embed
@@ -398,7 +434,7 @@ class Client:
         # Top-p (nucleus) sampling
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(
-            F.softmax(sorted_logits, dim=-1), dim=-1)
+            functional.softmax(sorted_logits, dim=-1), dim=-1)
 
         # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > top_p
@@ -412,7 +448,7 @@ class Client:
         logits[indices_to_remove] = float("-inf")
 
         # Sample
-        probs = F.softmax(logits, dim=-1)
+        probs = functional.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def close(self):
@@ -440,7 +476,7 @@ def print_metrics(metrics: GenerationMetrics) -> None:
         print(f"{'Phase':<12} {'Min':>8} {'Median':>8} {'Max':>8} {'Total':>10}")
         print("-" * 48)
 
-        phases = ["embed", "network", "de_embed", "sample", "total"]
+        phases = ["embed", "nvib", "network", "de_embed", "sample", "total"]
         for phase in phases:
             values = [getattr(t, f"{phase}_ms") for t in metrics.timings]
             sorted_vals = sorted(values)
