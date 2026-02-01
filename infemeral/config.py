@@ -69,7 +69,7 @@ class NVIBSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="INFEMERAL_NVIB_")
 
     beta: float = Field(
-        default=1.0,
+        default=100.0,
         description="Privacy budget parameter (higher = less noise, better utility)",
     )
     mu_init: float = Field(
