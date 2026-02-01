@@ -68,6 +68,16 @@ def mock_kv_cache():
     return keys, values
 
 
+@pytest.fixture
+def nvib_cloaker():
+    """Get NVIB cloaker if available, skip otherwise."""
+    try:
+        from infemeral.nvib import NVIBCloaker
+        return NVIBCloaker(dim=4096, beta=1.0, seed=42)
+    except (ImportError, RuntimeError):
+        pytest.skip("NVIB library not available (run 'make' to build)")
+
+
 # Configure pytest marks
 def pytest_configure(config):
     """Configure custom pytest marks."""
