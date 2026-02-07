@@ -1,8 +1,5 @@
 """Pytest configuration and shared fixtures."""
 
-import os
-import tempfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -76,6 +73,41 @@ def nvib_cloaker():
         return NVIBCloaker(dim=4096, beta=1.0, seed=42)
     except (ImportError, RuntimeError):
         pytest.skip("NVIB library not available (run 'make' to build)")
+
+
+@pytest.fixture
+def nvib_cloaker_5120():
+    """Get NVIB cloaker with 5120 dimension (DeepSeek/Qwen models)."""
+    try:
+        from infemeral.nvib import NVIBCloaker
+        return NVIBCloaker(dim=5120, beta=100.0, seed=42)
+    except (ImportError, RuntimeError):
+        pytest.skip("NVIB library not available (run 'make' to build)")
+
+
+@pytest.fixture
+def deepseek_client_weights(tmp_path):
+    """Create mock DeepSeek client weights for testing."""
+    from safetensors.torch import save_file
+
+    # DeepSeek/Qwen dimensions
+    hidden_size = 5120
+    vocab_size = 152064  # Qwen vocab size
+
+    weights = {
+        "embed_tokens.weight": torch.randn(vocab_size, hidden_size, dtype=torch.float16),
+    }
+
+    weights_path = tmp_path / "deepseek_client_weights.safetensors"
+    save_file(weights, str(weights_path), metadata={"tied_embeddings": "true"})
+
+    return str(weights_path)
+
+
+@pytest.fixture
+def sample_hidden_states_5120():
+    """Create sample hidden states with 5120 dimension (DeepSeek)."""
+    return torch.randn(1, 10, 5120)
 
 
 # Configure pytest marks

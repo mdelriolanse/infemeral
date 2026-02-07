@@ -1,0 +1,23 @@
+---
+description: Initialize agent understanding of the codebase architecture.
+---
+
+**Purpose:**
+Directly orient the agent to the project structure and core logic to establish a functional mental map.
+
+**Input:**
+- **Context Map:** @CLAUDE.md
+- **Directory Structure:** !tree -L 2 -I 'node_modules|.git'
+- **Timestamp**: !date +%Y-%m-%d_%H-%M-%S
+- **Output Directory**: ./agent/ 
+
+**Workflow:**
+1. **Read Step**: Analyze the @CLAUDE.md and @agent/primer.md (if either exists) file to identify primary technologies and coding standards.
+2. **Analysis Step**: Examine the root directory structure provided by the tree command.
+3. **Execution**:
+   * Identify the entry point of the application.
+   * Locate core business logic vs. configuration files.
+   * **Important**: If @CLAUDE.md and @agent/primer.md are not found, scan the `package.json` or equivalent to infer project type.
+
+**Output:**
+**Report Step**: Provide a brief summary of the tech stack, primary architecture pattern, and a list of the 5 most critical files for development. Save your results to `{{Output Directory}}primer.md`

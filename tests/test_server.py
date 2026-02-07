@@ -31,9 +31,10 @@ class TestKVCacheManagement:
             save_kv_cache,
         )
 
-        # Mock settings to use temp dir
+        # Mock settings to use temp dir with disk mode (tests disk I/O explicitly)
         with mock.patch("infemeral.server.server_settings") as mock_settings:
             mock_settings.kv_cache_dir = str(temp_cache_dir)
+            mock_settings.kv_cache_mode = "disk"  # Explicitly use disk mode for this test
 
             session_id = "test_session"
             session_key = generate_session_key()
@@ -69,6 +70,7 @@ class TestKVCacheManagement:
 
         with mock.patch("infemeral.server.server_settings") as mock_settings:
             mock_settings.kv_cache_dir = str(temp_cache_dir)
+            mock_settings.kv_cache_mode = "disk"
 
             result = load_kv_cache("nonexistent", generate_session_key(), "cpu")
             assert result is None
@@ -83,6 +85,7 @@ class TestKVCacheManagement:
 
         with mock.patch("infemeral.server.server_settings") as mock_settings:
             mock_settings.kv_cache_dir = str(temp_cache_dir)
+            mock_settings.kv_cache_mode = "disk"
 
             session_id = "test_session"
             session_key = generate_session_key()
@@ -109,6 +112,7 @@ class TestKVCacheManagement:
 
         with mock.patch("infemeral.server.server_settings") as mock_settings:
             mock_settings.kv_cache_dir = str(temp_cache_dir)
+            mock_settings.kv_cache_mode = "disk"
 
             session_id = "test_session"
             correct_key = generate_session_key()

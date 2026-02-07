@@ -18,11 +18,14 @@ from infemeral.tensors import pack_kv_cache, pack_kv_cache_v2, unpack_kv_cache
 
 @pytest.fixture
 def temp_kv_dir(tmp_path):
-    """Override KV cache directory for tests."""
-    original = server_settings.kv_cache_dir
+    """Override KV cache directory for tests (uses disk mode)."""
+    original_dir = server_settings.kv_cache_dir
+    original_mode = server_settings.kv_cache_mode
     server_settings.kv_cache_dir = str(tmp_path)
+    server_settings.kv_cache_mode = "disk"  # Use disk mode for these tests
     yield tmp_path
-    server_settings.kv_cache_dir = original
+    server_settings.kv_cache_dir = original_dir
+    server_settings.kv_cache_mode = original_mode
 
 
 def test_kv_cache_format_roundtrip():
@@ -157,9 +160,9 @@ def test_session_isolation_multi_turn(temp_kv_dir):
     key_1 = generate_session_key()
     key_2 = generate_session_key()
 
-    # Create different KV caches
-    kv_1 = tuple([(torch.ones(1, 32, 5, 128), torch.ones(1, 32, 5, 128))])
-    kv_2 = tuple([(torch.zeros(1, 32, 5, 128), torch.zeros(1, 32, 5, 128))])
+    # Create different KV caches (use float16 to match serialization output)
+    kv_1 = tuple([(torch.ones(1, 32, 5, 128, dtype=torch.float16), torch.ones(1, 32, 5, 128, dtype=torch.float16))])
+    kv_2 = tuple([(torch.zeros(1, 32, 5, 128, dtype=torch.float16), torch.zeros(1, 32, 5, 128, dtype=torch.float16))])
 
     # Save both
     save_kv_cache(session_id_1, kv_1, key_1)
@@ -170,7 +173,7 @@ def test_session_isolation_multi_turn(temp_kv_dir):
     loaded_2 = load_kv_cache(session_id_2, key_2, device="cpu")
 
     assert loaded_1 is not None and loaded_2 is not None
-    # Convert to same dtype for comparison
+    # Verify values match (both should be float16 now)
     assert torch.allclose(loaded_1[0][0], torch.ones(1, 32, 5, 128, dtype=torch.float16), atol=1e-3)
     assert torch.allclose(loaded_2[0][0], torch.zeros(1, 32, 5, 128, dtype=torch.float16), atol=1e-3)
 

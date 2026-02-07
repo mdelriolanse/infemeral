@@ -8,7 +8,11 @@ Uses Tensorizer for fast model loading with AWQ quantization support.
 
 import logging
 import signal
+import threading
+import time
+from collections import OrderedDict
 from concurrent import futures
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +42,278 @@ logger = logging.getLogger(__name__)
 # Global model instance (persists across serverless invocations)
 _model = None
 _config = None
+
+
+# Forward declarations for disk I/O functions (defined after load_model)
+def get_kv_cache_path(session_id: str) -> Path:
+    """Get path for session's KV cache."""
+    cache_dir = Path(server_settings.kv_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{session_id}.bin"
+
+
+def load_kv_cache_from_disk(
+    session_id: str,
+    session_key: bytes,
+    device: str | None = None,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
+    """Load encrypted KV cache from disk (Network Volume).
+
+    Returns None if no cache exists for this session.
+    Returns tuple of (key, value) pairs for each layer.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    cache_path = get_kv_cache_path(session_id)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with open(cache_path, "rb") as f:
+            # Read nonce (first 12 bytes)
+            nonce = f.read(12)
+            ciphertext = f.read()
+
+        # Decrypt
+        plaintext = decrypt_bytes(ciphertext, session_key, nonce)
+
+        # Unpack KV tensors (auto-detects v1 or v2 format)
+        result = unpack_kv_cache(plaintext, device)
+
+        # If v1 format (flat tensors), return None to force rebuild
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], torch.Tensor):
+            logger.warning(f"Session {session_id[:8]} has v1 KV cache, ignoring (will rebuild)")
+            return None
+
+        # Validate layer count matches model
+        if _config is not None:
+            expected_layers = _config.num_hidden_layers
+            if len(result) != expected_layers:
+                logger.warning(
+                    f"KV cache layer count mismatch: expected {expected_layers}, got {len(result)}"
+                )
+                return None
+
+        return result
+
+    except Exception as e:
+        logger.warning(f"Failed to load KV cache from disk: {e}")
+        return None
+
+
+def save_kv_cache_to_disk(
+    session_id: str,
+    kv_tuples: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    session_key: bytes,
+) -> None:
+    """Save encrypted KV cache to disk (Network Volume).
+
+    Args:
+        session_id: Session identifier
+        kv_tuples: Tuple of (key, value) pairs for each layer
+        session_key: Encryption key
+    """
+    cache_path = get_kv_cache_path(session_id)
+
+    # Pack and encrypt
+    plaintext = pack_kv_cache_v2(kv_tuples)
+    ciphertext, nonce = encrypt_bytes(plaintext, session_key)
+
+    # Write nonce + ciphertext
+    with open(cache_path, "wb") as f:
+        f.write(nonce)
+        f.write(ciphertext)
+
+
+@dataclass
+class CachedSession:
+    """In-memory cached session data."""
+
+    kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    session_key: bytes
+    last_access: float = field(default_factory=time.time)
+    token_count: int = 0
+    last_checkpoint_token: int = 0
+
+
+class SessionKVCache:
+    """In-memory LRU cache for KV tensors across sessions.
+
+    Keeps KV cache in GPU memory between token generations to avoid
+    disk I/O on every token. Implements LRU eviction when max_sessions
+    is reached.
+    """
+
+    def __init__(self, max_sessions: int = 10):
+        self._cache: OrderedDict[str, CachedSession] = OrderedDict()
+        self._max_sessions = max_sessions
+        self._lock = threading.Lock()
+
+    def get(
+        self, session_id: str, session_key: bytes, device: str | None = None
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
+        """Get KV cache for session from memory, falling back to disk.
+
+        Args:
+            session_id: Session identifier
+            session_key: Encryption key for disk fallback
+            device: Target device for tensors
+
+        Returns:
+            KV cache tuples or None if not found
+        """
+        with self._lock:
+            if session_id in self._cache:
+                # Move to end (most recently used)
+                self._cache.move_to_end(session_id)
+                cached = self._cache[session_id]
+                cached.last_access = time.time()
+                logger.debug(f"Memory cache hit for session {session_id[:8]}")
+                return cached.kv_cache
+
+        # Fallback to disk if not in memory
+        if server_settings.kv_cache_mode in ("disk", "hybrid"):
+            disk_cache = load_kv_cache_from_disk(session_id, session_key, device)
+            if disk_cache is not None:
+                # Load into memory cache
+                self.put(session_id, disk_cache, session_key, token_count=disk_cache[0][0].shape[2])
+                logger.debug(f"Loaded session {session_id[:8]} from disk into memory")
+                return disk_cache
+
+        return None
+
+    def put(
+        self,
+        session_id: str,
+        kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+        session_key: bytes,
+        token_count: int = 0,
+    ) -> None:
+        """Store KV cache for session in memory.
+
+        Args:
+            session_id: Session identifier
+            kv_cache: KV cache tuples
+            session_key: Encryption key (for checkpointing)
+            token_count: Current token count in the cache
+        """
+        with self._lock:
+            # Evict if at capacity
+            while len(self._cache) >= self._max_sessions:
+                evicted_id, evicted_session = self._cache.popitem(last=False)
+                logger.info(f"Evicting session {evicted_id[:8]} from memory cache")
+                # Checkpoint to disk before eviction (hybrid mode)
+                if server_settings.kv_cache_mode == "hybrid":
+                    self._checkpoint_to_disk(evicted_id, evicted_session)
+
+            if session_id in self._cache:
+                # Update existing
+                self._cache.move_to_end(session_id)
+                cached = self._cache[session_id]
+                cached.kv_cache = kv_cache
+                cached.last_access = time.time()
+                cached.token_count = token_count
+            else:
+                # Insert new
+                self._cache[session_id] = CachedSession(
+                    kv_cache=kv_cache,
+                    session_key=session_key,
+                    token_count=token_count,
+                )
+
+    def should_checkpoint(self, session_id: str) -> bool:
+        """Check if session should be checkpointed to disk.
+
+        Returns True if token_count has grown by checkpoint_interval since last checkpoint.
+        """
+        interval = server_settings.session_checkpoint_interval
+        if interval <= 0:
+            return False
+
+        with self._lock:
+            if session_id not in self._cache:
+                return False
+            cached = self._cache[session_id]
+            return (cached.token_count - cached.last_checkpoint_token) >= interval
+
+    def checkpoint(self, session_id: str) -> None:
+        """Checkpoint session to disk.
+
+        Args:
+            session_id: Session identifier
+        """
+        with self._lock:
+            if session_id not in self._cache:
+                return
+            cached = self._cache[session_id]
+            self._checkpoint_to_disk(session_id, cached)
+            cached.last_checkpoint_token = cached.token_count
+
+    def _checkpoint_to_disk(self, session_id: str, cached: CachedSession) -> None:
+        """Write session KV cache to disk (called within lock)."""
+        try:
+            save_kv_cache_to_disk(session_id, cached.kv_cache, cached.session_key)
+            logger.debug(f"Checkpointed session {session_id[:8]} to disk")
+        except Exception as e:
+            logger.warning(f"Failed to checkpoint session {session_id[:8]}: {e}")
+
+    def delete(self, session_id: str) -> None:
+        """Remove session from memory cache."""
+        with self._lock:
+            if session_id in self._cache:
+                del self._cache[session_id]
+                logger.debug(f"Deleted session {session_id[:8]} from memory cache")
+
+    def persist_session(self, session_id: str) -> None:
+        """Explicitly persist session to disk."""
+        with self._lock:
+            if session_id in self._cache:
+                self._checkpoint_to_disk(session_id, self._cache[session_id])
+
+    def cleanup_expired(self, max_age_seconds: int = 3600) -> int:
+        """Remove sessions older than max_age from memory.
+
+        Args:
+            max_age_seconds: Maximum age in seconds
+
+        Returns:
+            Number of sessions cleaned up
+        """
+        now = time.time()
+        to_remove = []
+
+        with self._lock:
+            for session_id, cached in self._cache.items():
+                if now - cached.last_access > max_age_seconds:
+                    to_remove.append(session_id)
+                    # Checkpoint before removal in hybrid mode
+                    if server_settings.kv_cache_mode == "hybrid":
+                        self._checkpoint_to_disk(session_id, cached)
+
+            for session_id in to_remove:
+                del self._cache[session_id]
+
+        if to_remove:
+            logger.info(f"Cleaned up {len(to_remove)} expired sessions from memory")
+
+        return len(to_remove)
+
+    def __len__(self) -> int:
+        """Return number of cached sessions."""
+        return len(self._cache)
+
+
+# Global in-memory KV cache (shared across requests)
+_session_kv_cache: SessionKVCache | None = None
+
+
+def get_session_kv_cache() -> SessionKVCache:
+    """Get or create the global session KV cache."""
+    global _session_kv_cache
+    if _session_kv_cache is None:
+        _session_kv_cache = SessionKVCache(max_sessions=server_settings.max_cached_sessions)
+    return _session_kv_cache
 
 
 def load_model(device: str | None = None) -> torch.nn.Module:
@@ -123,61 +399,30 @@ def load_model(device: str | None = None) -> torch.nn.Module:
     return _model
 
 
-def get_kv_cache_path(session_id: str) -> Path:
-    """Get path for session's KV cache."""
-    cache_dir = Path(server_settings.kv_cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"{session_id}.bin"
-
-
 def load_kv_cache(
     session_id: str,
     session_key: bytes,
     device: str | None = None,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
-    """Load encrypted KV cache from Network Volume.
+    """Load KV cache for session, using in-memory cache when available.
+
+    Behavior depends on kv_cache_mode setting:
+    - 'memory': Check memory only, no disk fallback
+    - 'disk': Load directly from disk (legacy behavior)
+    - 'hybrid': Check memory first, fall back to disk
 
     Returns None if no cache exists for this session.
     Returns tuple of (key, value) pairs for each layer.
     """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    mode = server_settings.kv_cache_mode
 
-    cache_path = get_kv_cache_path(session_id)
-    if not cache_path.exists():
-        return None
+    if mode == "disk":
+        # Legacy behavior: direct disk I/O
+        return load_kv_cache_from_disk(session_id, session_key, device)
 
-    try:
-        with open(cache_path, "rb") as f:
-            # Read nonce (first 12 bytes)
-            nonce = f.read(12)
-            ciphertext = f.read()
-
-        # Decrypt
-        plaintext = decrypt_bytes(ciphertext, session_key, nonce)
-
-        # Unpack KV tensors (auto-detects v1 or v2 format)
-        result = unpack_kv_cache(plaintext, device)
-
-        # If v1 format (flat tensors), return None to force rebuild
-        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], torch.Tensor):
-            logger.warning(f"Session {session_id[:8]} has v1 KV cache, ignoring (will rebuild)")
-            return None
-
-        # Validate layer count matches model
-        if _config is not None:
-            expected_layers = _config.num_hidden_layers
-            if len(result) != expected_layers:
-                logger.warning(
-                    f"KV cache layer count mismatch: expected {expected_layers}, got {len(result)}"
-                )
-                return None
-
-        return result
-
-    except Exception as e:
-        logger.warning(f"Failed to load KV cache: {e}")
-        return None
+    # Memory or hybrid mode: use in-memory cache
+    cache = get_session_kv_cache()
+    return cache.get(session_id, session_key, device)
 
 
 def save_kv_cache(
@@ -185,34 +430,66 @@ def save_kv_cache(
     kv_tuples: tuple[tuple[torch.Tensor, torch.Tensor], ...],
     session_key: bytes,
 ) -> None:
-    """Save encrypted KV cache to Network Volume.
+    """Save KV cache for session, using in-memory cache when available.
+
+    Behavior depends on kv_cache_mode setting:
+    - 'memory': Store in memory only, no disk write
+    - 'disk': Write directly to disk (legacy behavior)
+    - 'hybrid': Store in memory, checkpoint to disk periodically
 
     Args:
         session_id: Session identifier
         kv_tuples: Tuple of (key, value) pairs for each layer
         session_key: Encryption key
     """
-    cache_path = get_kv_cache_path(session_id)
+    mode = server_settings.kv_cache_mode
 
-    # Pack and encrypt
-    plaintext = pack_kv_cache_v2(kv_tuples)
-    ciphertext, nonce = encrypt_bytes(plaintext, session_key)
+    if mode == "disk":
+        # Legacy behavior: direct disk I/O
+        save_kv_cache_to_disk(session_id, kv_tuples, session_key)
+        return
 
-    # Write nonce + ciphertext
-    with open(cache_path, "wb") as f:
-        f.write(nonce)
-        f.write(ciphertext)
+    # Memory or hybrid mode: use in-memory cache
+    cache = get_session_kv_cache()
+    token_count = kv_tuples[0][0].shape[2] if kv_tuples else 0
+    cache.put(session_id, kv_tuples, session_key, token_count)
+
+    # Periodic disk checkpoint in hybrid mode
+    if mode == "hybrid" and cache.should_checkpoint(session_id):
+        cache.checkpoint(session_id)
 
 
 def delete_kv_cache(session_id: str) -> None:
-    """Delete KV cache for a session."""
+    """Delete KV cache for a session from both memory and disk."""
+    # Remove from memory cache
+    if server_settings.kv_cache_mode != "disk":
+        cache = get_session_kv_cache()
+        cache.delete(session_id)
+
+    # Remove from disk
     cache_path = get_kv_cache_path(session_id)
     if cache_path.exists():
         cache_path.unlink()
 
 
+def persist_session(session_id: str) -> None:
+    """Explicitly persist a session's KV cache to disk.
+
+    Useful for checkpointing before expected server restarts or
+    for important sessions that should survive memory eviction.
+
+    Args:
+        session_id: Session identifier
+    """
+    if server_settings.kv_cache_mode != "disk":
+        cache = get_session_kv_cache()
+        cache.persist_session(session_id)
+
+
 def cleanup_old_sessions(max_age_seconds: int = 3600) -> int:
     """Delete KV cache files older than max_age.
+
+    Cleans both in-memory cache and disk files.
 
     Args:
         max_age_seconds: Maximum age in seconds (default: 1 hour)
@@ -220,22 +497,24 @@ def cleanup_old_sessions(max_age_seconds: int = 3600) -> int:
     Returns:
         Number of sessions cleaned up
     """
-    import time
-
-    kv_dir = Path(server_settings.kv_cache_dir)
-    if not kv_dir.exists():
-        return 0
-
-    now = time.time()
     cleaned = 0
 
-    for cache_file in kv_dir.glob("*.bin"):
-        try:
-            if now - cache_file.stat().st_mtime > max_age_seconds:
-                cache_file.unlink()
-                cleaned += 1
-        except Exception as e:
-            logger.warning(f"Failed to clean {cache_file.name}: {e}")
+    # Cleanup memory cache
+    if server_settings.kv_cache_mode != "disk":
+        cache = get_session_kv_cache()
+        cleaned += cache.cleanup_expired(max_age_seconds)
+
+    # Cleanup disk cache
+    kv_dir = Path(server_settings.kv_cache_dir)
+    if kv_dir.exists():
+        now = time.time()
+        for cache_file in kv_dir.glob("*.bin"):
+            try:
+                if now - cache_file.stat().st_mtime > max_age_seconds:
+                    cache_file.unlink()
+                    cleaned += 1
+            except Exception as e:
+                logger.warning(f"Failed to clean {cache_file.name}: {e}")
 
     if cleaned > 0:
         logger.info(f"Cleaned up {cleaned} old KV cache sessions")
@@ -365,6 +644,12 @@ def forward_transformer(
     else:
         raise ValueError("Unsupported model architecture")
 
+    # Convert hidden_states to model's expected dtype (float16 for quantized models)
+    # Client sends float32 for precision, but model weights are float16
+    model_dtype = next(model.parameters()).dtype
+    if hidden_states.dtype != model_dtype:
+        hidden_states = hidden_states.to(model_dtype)
+
     # Apply context windowing if needed
     if past_key_values is not None:
         past_key_values = apply_context_windowing(
@@ -386,20 +671,13 @@ def forward_transformer(
         # Directly populate cache lists instead of using update() to avoid torch.cat() non-contiguity
         # DynamicCache.update() concatenates tensors, creating non-contiguous views
         for layer_idx, (k, v) in enumerate(past_key_values):
-            # Ensure tensors are contiguous for SDPA attention
-            k_contig = k.contiguous()
-            v_contig = v.contiguous()
-            logger.info(f"Loading layer {layer_idx} cache: key={k_contig.shape}, value={v_contig.shape}, "
-                       f"key.is_contiguous={k_contig.is_contiguous()}, value.is_contiguous={v_contig.is_contiguous()}")
-            if k_contig.shape != v_contig.shape:
-                logger.error(f"MISMATCH at layer {layer_idx}: key={k_contig.shape} vs value={v_contig.shape}")
+            # Ensure tensors are contiguous for SDPA attention (only if needed)
+            k_contig = k if k.is_contiguous() else k.contiguous()
+            v_contig = v if v.is_contiguous() else v.contiguous()
             # Directly append to cache lists - avoids torch.cat() in update()
             cache.key_cache.append(k_contig)
             cache.value_cache.append(v_contig)
         past_len = past_key_values[0][0].shape[2]
-        logger.info(f"Loaded cache with {len(past_key_values)} layers, past_len={past_len}")
-    else:
-        logger.info("Initialized empty DynamicCache for first forward pass")
 
     # Position IDs
     if past_len > 0:
@@ -423,17 +701,6 @@ def forward_transformer(
     for i, layer in enumerate(layers):
         layer_attn = layer.self_attn
 
-        # Debug: log cache state before layer call (supports both 4.51 and 4.57+ API)
-        cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else len(cache)
-        if cache_len > 0:
-            logger.info(f"Layer {i} input - cache has {cache_len} entries")
-            if i == 0:  # Only log details for first layer to reduce noise
-                if hasattr(cache, 'key_cache'):
-                    for idx in range(min(3, len(cache.key_cache))):
-                        logger.info(f"  Cache[{idx}]: key={cache.key_cache[idx].shape}, value={cache.value_cache[idx].shape}")
-        else:
-            logger.info(f"Layer {i} input - cache empty (len={cache_len})")
-
         # Get rotary embedding module (try layer-specific first, then global)
         layer_rotary_emb = getattr(layer_attn, "rotary_emb", None)
         if layer_rotary_emb is None:
@@ -446,7 +713,6 @@ def forward_transformer(
         cos, sin = layer_rotary_emb(hidden_states, position_ids)
         layer_position_embeddings = (cos, sin)
 
-        logger.info(f"Layer {i}: calling with hidden_states={hidden_states.shape}, cache={type(cache)}")
         layer_out = layer(
             hidden_states,
             attention_mask=attention_mask,
@@ -461,12 +727,10 @@ def forward_transformer(
             # Layer returned tensor directly (no cache)
             hidden_states = layer_out
             layer_cache = None
-            logger.info(f"Layer {i}: returned Tensor directly (no cache tuple)")
         else:
             # Layer returned tuple (hidden_states, cache, ...)
             hidden_states = layer_out[0]
             layer_cache = layer_out[1] if len(layer_out) > 1 else None
-            logger.info(f"Layer {i}: returned tuple len={len(layer_out)}, cache type={type(layer_cache)}")
 
         # Ensure hidden_states maintains 3D shape [batch, seq_len, hidden_dim]
         if hidden_states.dim() == 2:
@@ -475,13 +739,6 @@ def forward_transformer(
         # Update cache reference (layer may return updated cache or modify in-place)
         if layer_cache is not None:
             cache = layer_cache
-            cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else len(cache)
-            logger.info(f"Layer {i}: updated cache reference, new cache has {cache_len} entries")
-        else:
-            # Check if original cache was updated in-place
-            cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else len(cache)
-            if cache_len > 0:
-                logger.info(f"Layer {i}: cache updated in-place, now has {cache_len} entries")
 
     # Final layer norm
     hidden_states = norm(hidden_states)
@@ -493,24 +750,13 @@ def forward_transformer(
         for layer_idx in range(len(cache.key_cache)):
             k = cache.key_cache[layer_idx]
             v = cache.value_cache[layer_idx]
-            if layer_idx == 0:  # Log only first layer to reduce noise
-                logger.info(f"Saving cache: {len(cache.key_cache)} layers, first layer key={k.shape}")
-            if k.shape != v.shape:
-                logger.error(f"SAVE MISMATCH at layer {layer_idx}: key={k.shape} vs value={v.shape}")
             new_key_values.append((k, v))
     elif hasattr(cache, 'layers') and len(cache.layers) > 0:
         # Transformers 4.57+ API: layers list with CacheLayer objects
         for layer_idx, layer_cache in enumerate(cache.layers):
             k = layer_cache.keys
             v = layer_cache.values
-            if layer_idx == 0:
-                logger.info(f"Saving cache: {len(cache.layers)} layers, first layer key={k.shape}")
-            if k.shape != v.shape:
-                logger.error(f"SAVE MISMATCH at layer {layer_idx}: key={k.shape} vs value={v.shape}")
             new_key_values.append((k, v))
-    else:
-        cache_len = len(cache.key_cache) if hasattr(cache, 'key_cache') else (len(cache.layers) if hasattr(cache, 'layers') else 0)
-        logger.warning(f"No cache to save: cache has {cache_len} entries")
 
     return hidden_states, tuple(new_key_values) if new_key_values else ()
 
@@ -543,7 +789,7 @@ class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
             dtype = request.dtype
             session_id = request.session_id
 
-            logger.info(f"Processing inference request for session {session_id[:8]}...")
+            logger.debug(f"Processing inference request for session {session_id[:8]}...")
 
             # Decrypt hidden states
             plaintext = decrypt_bytes(encrypted_data, session_key, nonce)
@@ -573,7 +819,7 @@ class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            logger.info(f"Inference complete for session {session_id[:8]}")
+            logger.debug(f"Inference complete for session {session_id[:8]}")
 
             # Build response with nonce prepended to output (client expects this format)
             return tensor_service_pb2.InferenceResponse(

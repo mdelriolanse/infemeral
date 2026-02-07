@@ -212,8 +212,8 @@ class TestNVIBSettings:
         """NVIB settings should have correct defaults."""
         from infemeral.config import nvib_settings
 
-        assert nvib_settings.beta == 1.0
-        assert nvib_settings.dim == 4096
+        assert nvib_settings.beta == 100.0  # Changed from 1.0 for coherent output
+        assert nvib_settings.dim == 0  # Auto-detect from model
         assert nvib_settings.mu_init == 0.0
         assert nvib_settings.log_sigma2_init == 0.0
         assert nvib_settings.simd_level == "auto"

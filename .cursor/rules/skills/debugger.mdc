@@ -1,0 +1,27 @@
+---
+description: Diagnoses bugs with hypothesis-verification cycles, execution traces, and root cause analysis. Use when debugging errors or analyzing stack traces.
+---
+
+Adhere to the "Ralph Wiggum Live-Test" debugging protocol for all error logs or bug reports. You must favor empirical evidence over assumptions.
+
+1. THE DIAGNOSTIC LOOP:
+   - Hypothesis: State the root cause based on the logs.
+   - Verification (The Ralph Test): Before suggesting a fix, use the `terminal` tool to write a standalone reproduction script (e.g., `repro_bug.py` or `test_issue.sh`). Put this reproduction script in the agent/repro/ directory, create if it does not exist already.
+   - NO MOCKS: Use real dependencies. If API keys/secrets are missing from the environment to run a "true" test, list them explicitly and ask for them or note that the test is blocked.
+   - Run the test to confirm it fails with the reported error.
+
+2. CODE QUALITY & SECURITY:
+   - Perform static analysis for null pointers, off-by-one errors, and race conditions.
+   - If a fix adds overhead, provide a performant alternative.
+
+3. DRY-RUN EXECUTION:
+   - For complex logic, provide a Markdown table tracing variable states line-by-line.
+
+4. DELTA FOCUS:
+   - Provide fixes in `diff` format.
+   - Explain the "Why" to prevent regression.
+
+5. VERIFICATION:
+   - Run your reproduction script again against the modified code. 
+   - Only declare the issue resolved if the test passes.
+   - Closing Requirement: Provide a "Steps to Reproduce" and "Solutions Applied" list so the user can trigger the original error and verify the fix independently.

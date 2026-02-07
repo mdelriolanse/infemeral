@@ -3,6 +3,22 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Model presets with architecture-specific defaults
+MODEL_PRESETS: dict[str, dict] = {
+    "llama-3.1-8b-awq": {
+        "model_id": "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+        "hidden_dim": 4096,
+        "num_layers": 32,
+        "architecture": "llama",
+    },
+    "deepseek-r1-32b-gptq": {
+        "model_id": "dwetzel/DeepSeek-R1-Distill-Qwen-32B-GPTQ-INT4",
+        "hidden_dim": 5120,
+        "num_layers": 64,
+        "architecture": "qwen",
+    },
+}
+
 
 class ClientSettings(BaseSettings):
     """Client-side settings."""
@@ -28,6 +44,10 @@ class ServerSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="INFEMERAL_SERVER_")
 
+    model_preset: str = Field(
+        default="llama-3.1-8b-awq",
+        description="Model preset name (llama-3.1-8b-awq, deepseek-r1-32b-gptq)",
+    )
     weights_dir: str = Field(
         default="/workspace/weights/model",
         description="Directory containing the full AWQ model (loaded via from_pretrained)",
@@ -62,6 +82,11 @@ class ServerSettings(BaseSettings):
         description="Number of tokens between disk checkpoints (0 to disable checkpointing)",
     )
 
+    @property
+    def model_config_preset(self) -> dict:
+        """Get preset configuration for the selected model."""
+        return MODEL_PRESETS.get(self.model_preset, MODEL_PRESETS["llama-3.1-8b-awq"])
+
 
 class NVIBSettings(BaseSettings):
     """NVIB (Nonparametric Variational Information Bottleneck) cloaking settings."""
@@ -89,8 +114,8 @@ class NVIBSettings(BaseSettings):
         description="SIMD level: auto/avx512/avx2/sse4/none",
     )
     dim: int = Field(
-        default=4096,
-        description="Embedding dimension (typically 4096 for Llama)",
+        default=0,
+        description="Embedding dimension (0 = auto-detect from model hidden_size)",
     )
 
 

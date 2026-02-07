@@ -1,0 +1,39 @@
+---
+description: Instructions for applying output styles to agent responses
+alwaysApply: true
+---
+
+# Output Style Application
+
+The agent must check and apply the current output style at the start of each response.
+
+## Style State File
+
+The current output style is stored in `.cursor/.current-output-style`. This file contains a single line with the style slug (e.g., "bullet-points", "json-structured") or "default".
+
+## Application Workflow
+
+1. **Check Style File**: At the beginning of each response, read `.cursor/.current-output-style` to determine the active style
+2. **Load Style Instructions**: If the style is not "default", read `.cursor/output-styles/{slug}.md` and extract the formatting guidelines
+3. **Apply Style**: Format the entire response according to the style's instructions:
+   - **Default**: Use normal, natural LLM output with standard markdown formatting
+   - **Other Styles**: Follow the specific formatting rules defined in the style file (content after YAML frontmatter)
+4. **Maintain Consistency**: Apply the same style throughout the entire response
+
+## Style Files Location
+
+All style files are located in `.cursor/output-styles/` with the format `{slug}.md`. Each file contains:
+- YAML frontmatter with `name` and `description`
+- Formatting instructions and guidelines
+
+## Default Behavior
+
+If `.cursor/.current-output-style` doesn't exist or contains "default", use normal LLM output formatting (standard markdown, natural language).
+
+## Important Notes
+
+- The style applies to the **entire response**, not just parts of it
+- Style instructions override default formatting behavior
+- If a style file is missing, fall back to default style
+- Style persists across multiple responses until changed via `/output-styles` command
+- This configuration is **independent** of `.claude/` directory - all paths reference `.cursor/`

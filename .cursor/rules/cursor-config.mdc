@@ -1,0 +1,35 @@
+---
+description: Cursor configuration overview - independent configuration system
+alwaysApply: false
+---
+
+# Cursor Configuration System
+
+This project uses a **completely independent** Cursor configuration system located in `.cursor/`. All configurations are self-contained and do not depend on `.claude/` directory.
+
+## Directory Structure
+
+```
+.cursor/
+├── rules/
+│   ├── agents/          # Agent definitions (.mdc files)
+│   ├── commands/        # Command definitions (.mdc files)
+│   └── skills/          # Skill definitions (.mdc files)
+├── output-styles/       # Output style definitions (.md files)
+├── .current-output-style # Current active output style (state file)
+└── settings.local.json  # Optional permissions file
+```
+
+## Key Points
+
+- **Independence**: All paths reference `.cursor/`, never `.claude/`
+- **Self-Contained**: All configurations are within `.cursor/` directory
+- **No Dependencies**: This system functions independently of any `.claude/` configuration
+
+## Usage
+
+- Agents: `.cursor/rules/agents/*.mdc`
+- Commands: `.cursor/rules/commands/*.mdc`
+- Skills: `.cursor/rules/skills/*.mdc`
+- Output Styles: `.cursor/output-styles/*.md`
+- Current Style: `.cursor/.current-output-style`

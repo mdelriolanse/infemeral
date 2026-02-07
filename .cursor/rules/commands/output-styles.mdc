@@ -1,0 +1,136 @@
+---
+allowed-tools: Read, Write, Bash
+argument-hint: [style-name] [--list]
+description: Switch output styles or list available styles. Use style names like "bullets", "json", "yaml", "markdown", etc. The selected style persists until changed.
+---
+
+# Output Styles Command
+
+Switch the agent's output style or list available styles. The selected style persists for subsequent responses until changed again.
+
+## Usage
+
+- `/output-styles --list` - List all available output styles
+- `/output-styles bullets` - Switch to bullet-points style
+- `/output-styles json` - Switch to JSON structured style
+- `/output-styles default` - Switch back to default (normal LLM output)
+
+## State File
+
+The current output style is stored in `.cursor/.current-output-style`. This file contains the slug of the active style (e.g., "bullet-points", "json-structured") or "default" for normal output.
+
+## Workflow
+
+### When `--list` flag is provided:
+
+1. **Scan Output Styles Directory**: Read all `.md` files from `.cursor/output-styles/`
+2. **Parse Frontmatter**: Extract `name` and `description` from YAML frontmatter
+3. **Display List**: Show all available styles in a formatted list:
+   ```
+   Available Output Styles:
+   
+   1. Bullet Points - Hierarchical bullet points for quick scanning
+   2. GenUI - Generative UI with embedded modern styling
+   3. HTML Structured - Clean semantic HTML with proper structure
+   4. JSON Structured - Structured JSON output for programmatic parsing and scripting
+   5. Markdown Focused - Full markdown features for maximum readability
+   6. Table Based - Markdown tables for better organization and scanning
+   7. TTS Summary - Audio task completion announcements with TTS
+   8. Ultra Concise - Minimal words maximum speed direct actions
+   9. YAML Structured - Structured YAML with hierarchical key value pairs
+   
+   Default - Normal LLM output (no special formatting)
+   ```
+4. **Show Current Style**: Indicate which style is currently active (read from `.cursor/.current-output-style`)
+
+### When a style name is provided:
+
+1. **Normalize Style Name**: Map common names to slugs:
+   - "bullets" or "bullet" → "bullet-points"
+   - "json" → "json-structured"
+   - "yaml" → "yaml-structured"
+   - "markdown" or "md" → "markdown-focused"
+   - "html" → "html-structured"
+   - "table" → "table-based"
+   - "ultra-concise" or "concise" → "ultra-concise"
+   - "genui" → "genui"
+   - "tts" → "tts-summary"
+   - "default" or "normal" → "default"
+
+2. **Validate Style**: Check if the style file exists in `.cursor/output-styles/{slug}.md` (or is "default")
+
+3. **Read Style Instructions**: If not "default", read the style file and extract the instructions (content after the YAML frontmatter)
+
+4. **Save State**: Write the slug to `.cursor/.current-output-style`
+
+5. **Confirm Switch**: Inform the user that the style has been switched and briefly describe what it does
+
+6. **Apply Style**: From this point forward, apply the style instructions to all responses until changed again
+
+### Style Application
+
+After switching styles, the agent must:
+
+1. **Read Current Style**: At the start of each response, check `.cursor/.current-output-style` to see what style is active
+
+2. **Load Style Instructions**: If not "default", read `.cursor/output-styles/{slug}.md` and apply the formatting guidelines
+
+3. **Format Response**: Structure the response according to the style's instructions:
+   - For "default": Use normal, natural LLM output
+   - For other styles: Follow the specific formatting rules in the style file
+
+4. **Maintain Style**: Continue using the selected style until explicitly changed
+
+## Style Name Mapping
+
+Common shortcuts and their corresponding slugs:
+
+| Input | Slug | Description |
+|-------|------|-------------|
+| bullets, bullet | bullet-points | Hierarchical bullet points |
+| json | json-structured | Structured JSON output |
+| yaml | yaml-structured | Structured YAML output |
+| markdown, md | markdown-focused | Full markdown features |
+| html | html-structured | Clean semantic HTML |
+| table | table-based | Markdown tables |
+| concise, ultra-concise | ultra-concise | Minimal words |
+| genui | genui | Generative UI |
+| tts | tts-summary | TTS announcements |
+| default, normal | default | Normal LLM output |
+
+## Examples
+
+**List styles:**
+```
+/output-styles --list
+```
+
+**Switch to bullets:**
+```
+/output-styles bullets
+```
+Response: "Switched to Bullet Points style. All subsequent responses will use hierarchical bullet points for quick scanning."
+
+**Switch to JSON:**
+```
+/output-styles json
+```
+Response: "Switched to JSON Structured style. All subsequent responses will be formatted as valid JSON for programmatic parsing."
+
+**Switch back to default:**
+```
+/output-styles default
+```
+Response: "Switched to default output style. Responses will use normal formatting."
+
+## Implementation Notes
+
+- The state file (`.cursor/.current-output-style`) should be created if it doesn't exist
+- If the state file doesn't exist, default to "default" style
+- Style names are case-insensitive
+- Partial matches are allowed (e.g., "bullet" matches "bullet-points")
+- If an invalid style is provided, show an error and list available styles
+
+## Current Request
+
+$ARGUMENTS

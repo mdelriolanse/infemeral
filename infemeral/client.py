@@ -158,8 +158,14 @@ class Client:
         if HAS_NVIB:
             try:
                 from infemeral.config import nvib_settings
+
+                # Auto-detect dimension from embedding layer if dim=0
+                nvib_dim = nvib_settings.dim
+                if nvib_dim == 0:
+                    nvib_dim = self.embedding.embed_tokens.weight.shape[1]
+
                 self.nvib_cloaker = NVIBCloaker(
-                    dim=nvib_settings.dim,
+                    dim=nvib_dim,
                     beta=nvib_settings.beta,
                     mu_init=nvib_settings.mu_init,
                     log_sigma2_init=nvib_settings.log_sigma2_init,

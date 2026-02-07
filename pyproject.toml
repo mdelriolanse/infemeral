@@ -26,6 +26,8 @@ dependencies = [
     # RunPod
     "runpod>=1.7.0",
     "autoawq>=0.2.9",
+    "auto-gptq>=0.6.0",
+    "optimum>=1.16.0",
     "intel-extension-for-pytorch>=2.8.0",
 ]
 
@@ -35,6 +37,9 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "ruff>=0.5.0",
 ]
+
+[project.scripts]
+cursor-output-styles = "infemeral.cli:main"
 
 [build-system]
 requires = ["hatchling"]

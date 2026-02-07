@@ -230,7 +230,9 @@ def print_result(result: BenchmarkResult) -> None:
         print(f"{phase:<12} {p50:>10.2f} {p95:>10.2f} {p99:>10.2f}")
 
 
-def print_comparison(cpu_result: BenchmarkResult | None, gpu_result: BenchmarkResult | None) -> None:
+def print_comparison(
+    cpu_result: BenchmarkResult | None, gpu_result: BenchmarkResult | None
+) -> None:
     """Print side-by-side comparison of CPU vs GPU results."""
     if not cpu_result or not gpu_result:
         return
@@ -285,7 +287,7 @@ def check_regression(result: BenchmarkResult) -> bool:
     """Check if results indicate a performance regression."""
     threshold = BASELINE_GPU_MS if result.device == "cuda" else BASELINE_CPU_MS
     if result.total_p50 > threshold * 1.2:
-        print(f"\nWARNING: Performance regression detected!")
+        print("\nWARNING: Performance regression detected!")
         print(f"  Expected p50 latency: <= {threshold * 1.2:.1f} ms")
         print(f"  Actual p50 latency:   {result.total_p50:.1f} ms")
         return True

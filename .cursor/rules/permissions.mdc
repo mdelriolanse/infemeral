@@ -1,0 +1,49 @@
+---
+description: Permissions and allowed operations based on settings.local.json configuration
+alwaysApply: true
+---
+
+# Permissions and Allowed Operations
+
+The `.cursor/settings.local.json` file (if it exists) defines permissions for operations. When executing commands or using tools, respect these permissions. Only operations listed in `permissions.allow` are permitted. If the file doesn't exist, use reasonable defaults.
+
+## Allowed Operations
+
+Based on the current configuration, the following operations are allowed:
+
+### Web Operations
+- WebSearch
+- WebFetch from github.com
+- WebFetch from raw.githubusercontent.com
+- WebFetch from docs.anthropic.com
+
+### Bash Commands
+- `python -m pytest:*` - Running pytest tests
+- `ruff check:*` - Running ruff linter
+- `source .venv/bin/activate` - Activating virtual environment
+- `python:*` - Python commands
+- `pytest:*` - Pytest commands
+- `pip install:*` - Installing Python packages
+- `uv pip install:*` - Installing packages with uv
+- `git add:*` - Git staging operations
+- `git commit:*` - Git commit operations (including specific commit message format)
+- `git commit -m "*"` - Git commits with messages
+- `ls:*` - Listing files
+- `./scp_to_runpod.sh:*` - SCP script execution
+- `ssh:*` - SSH operations (including specific RunPod test command)
+- `chmod:*` - Changing file permissions
+- `./run_inference.sh:*` - Running inference script
+- `grep:*` - Grep operations
+
+## Usage Guidelines
+
+1. **Permission Checking**: Before executing any operation, verify it's allowed in `.cursor/settings.local.json` (if it exists)
+2. **Safe Operations**: If a tool or operation is listed in `permissions.allow`, it's safe to use
+3. **Restricted Operations**: Operations not explicitly listed should not be executed without user approval
+4. **Security**: Never execute operations that could compromise system security or data integrity
+
+## Important Notes
+
+- The permissions file may be updated over time - always check the current state before executing operations
+- Some operations have specific patterns (e.g., git commit with specific message format) - follow those patterns exactly
+- SSH operations are allowed but should be used carefully, especially with specific host configurations

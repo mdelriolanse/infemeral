@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-Infemeral is a **zero-trust distributed LLM inference system** that splits model execution between client and server to ensure privacy. The server never sees raw tokens, embeddings, or conversation context. The system supports two deployment modes: **traditional gRPC** (planned) and **RunPod serverless** (HTTP-based, currently implemented).
+Infemeral is a **zero-trust distributed LLM inference system** that splits model execution between client and server to ensure privacy. The server never sees raw tokens, embeddings, or conversation context. The system supports two deployment modes: **traditional gRPC** (fully implemented) and **RunPod serverless** (HTTP-based, server implemented, client missing).
 
 ---
 
@@ -57,20 +57,23 @@ Infemeral is a **zero-trust distributed LLM inference system** that splits model
 
 | Component | Protocol | Status | Code Location | When Used |
 |-----------|----------|--------|----------------|-----------|
-| **Client** | gRPC | ✅ Implemented | `infemeral/client.py::Client._call_server()` | Every token generation (line 160: `stub.Infer()`) |
+| **Client** | gRPC | ✅ Implemented | `infemeral/client.py::Client._call_server()` | Every token generation (line 226: `stub.Infer()`) |
 | **Client** | HTTP | ❌ Missing | N/A | Would be used for RunPod serverless |
-| **Server** | gRPC | ❌ Missing | N/A | Would be used for traditional deployment |
+| **Server** | gRPC | ✅ Implemented | `infemeral/server.py::TensorInferenceServicer` + `serve_grpc()` | Traditional deployment (line 546-604) |
 | **Server** | HTTP | ✅ Implemented | `infemeral/server.py::handler()` | Every RunPod request (via `runpod.serverless.start()`) |
 
-### Current State: Protocol Mismatch
+### Current State: Protocol Support
 
-**Critical Finding**: The codebase has a **protocol mismatch**:
+**Status**: Both protocols are supported on the server side:
 - ✅ **Client**: Implements **gRPC only** (`infemeral/client.py`)
-- ✅ **Server**: Implements **HTTP only** (RunPod serverless, `infemeral/server.py`)
-- ❌ **No gRPC server** implementation exists
+- ✅ **Server**: Implements **both gRPC and HTTP** (`infemeral/server.py`)
+  - gRPC: `TensorInferenceServicer` class + `serve_grpc()` function
+  - HTTP: `handler()` function for RunPod serverless
 - ❌ **No HTTP client** implementation exists
 
-**Result**: The current client cannot communicate with the current server without modifications.
+**Result**: 
+- ✅ **gRPC works end-to-end**: Client can connect to gRPC server
+- ❌ **HTTP incomplete**: Server supports HTTP, but client only supports gRPC
 
 **When Network is Used**:
 - **Once per token generation**: Client sends cloaked embedding → Server processes → Server returns transformed hidden states
@@ -79,11 +82,13 @@ Infemeral is a **zero-trust distributed LLM inference system** that splits model
 
 ---
 
-### 1. gRPC (Client-Side Only)
+### 1. gRPC (Client + Server)
 
-**Status**: Client implementation complete, server missing
+**Status**: ✅ Both client and server implementations complete
 
-**Where Used**: `infemeral/client.py::Client._call_server()`
+**Where Used**: 
+- **Client**: `infemeral/client.py::Client._call_server()` (line 205)
+- **Server**: `infemeral/server.py::TensorInferenceServicer.Infer()` (line 477) + `serve_grpc()` (line 546)
 
 **Protocol**: `tensor_service.proto`
 - **Service**: `TensorInference`
@@ -112,6 +117,11 @@ TCP Layer:          Port 50051
        options=[
            ("grpc.max_send_message_length", 100 * 1024 * 1024),    # 100MB
            ("grpc.max_receive_message_length", 100 * 1024 * 1024), # 100MB
+           ("grpc.keepalive_time_ms", 10000),
+           ("grpc.keepalive_timeout_ms", 5000),
+           ("grpc.keepalive_permit_without_calls", 1),
+           ("grpc.http2.min_time_between_pings_ms", 10000),
+           ("grpc.http2.max_pings_without_data", 0),
        ],
    )
    self._stub = tensor_service_pb2_grpc.TensorInferenceStub(self._channel)
@@ -136,15 +146,21 @@ TCP Layer:          Port 50051
    response = self.stub.Infer(request)  # Synchronous unary RPC
    ```
 
-4. **Response Handling**:
+4. **Response Handling** (line 228-243):
    ```python
    if response.error:
        raise RuntimeError(f"Server error: {response.error}")
    
+   # Server prepends nonce (12 bytes) to encrypted output
+   response_data = bytes(response.output)
+   response_nonce = response_data[:12]
+   encrypted_output = response_data[12:]
+   decrypted_output = decrypt_bytes(encrypted_output, self.session_key, response_nonce)
+   
    tensor = deserialize_tensor(
-       response.output,      # bytes (encrypted)
-       list(response.shape), # list[int64]
-       response.dtype,      # str
+       decrypted_output,
+       list(response.shape),
+       response.dtype,
        device=self.device,
    )
    ```
@@ -176,16 +192,48 @@ InferenceResponse {
 - ⚠️ **Application-level encryption**: AES-256-GCM (encrypts payload, not transport)
 - ⚠️ **Session key**: Sent plaintext in `encrypted_session_key` field (TODO: RSA-OAEP)
 
-**Server Implementation**: **MISSING**
-- `tensor_service_pb2_grpc.py` has base class `TensorInferenceServicer`
-- No actual server implementation found
-- Would need to:
-  1. Implement `TensorInferenceServicer` subclass
-  2. Override `Infer()` method
-  3. Convert protobuf → dict format
-  4. Call `handler()` function
-  5. Convert dict → protobuf response
-  6. Start gRPC server on port 50051
+**Server Implementation** (`infemeral/server.py`):
+
+1. **Servicer Class** (`TensorInferenceServicer`, line 470):
+   ```python
+   class TensorInferenceServicer(tensor_service_pb2_grpc.TensorInferenceServicer):
+       def Infer(self, request, context):
+           # Extract protobuf fields
+           # Decrypt and deserialize
+           # Process via forward_transformer()
+           # Encrypt and serialize response
+           # Return protobuf InferenceResponse
+   ```
+
+2. **Server Startup** (`serve_grpc()`, line 546):
+   ```python
+   def serve_grpc(port: int | None = None, max_workers: int = 4):
+       # Load model
+       # Create gRPC server with 100MB message limits
+       # Register TensorInferenceServicer
+       # Bind to port (default: 50051)
+       # Start server with graceful shutdown handling
+   ```
+
+3. **Response Format**: Server prepends nonce to encrypted output (line 532):
+   ```python
+   return tensor_service_pb2.InferenceResponse(
+       output=output_nonce + encrypted_output,  # Nonce (12B) + ciphertext
+       shape=output_shape,
+       dtype=output_dtype,
+       tokens_processed=shape[1],
+   )
+   ```
+
+4. **Entry Point**: Supports both gRPC and RunPod modes (line 705):
+   ```python
+   if __name__ == "__main__":
+       parser.add_argument("--mode", choices=["grpc", "runpod"], default="grpc")
+       if args.mode == "grpc":
+           serve_grpc(port=args.port, max_workers=args.workers)
+       else:
+           runpod.serverless.start({"handler": handler})
+   ```
 
 ---
 
@@ -210,11 +258,13 @@ TCP Layer:          Port 443 (HTTPS)
 
 **Server Implementation Details** (`infemeral/server.py`):
 
-1. **Entry Point**:
+1. **Entry Point** (line 705):
    ```python
    if __name__ == "__main__":
-       import runpod
-       runpod.serverless.start({"handler": handler})
+       parser.add_argument("--mode", choices=["grpc", "runpod"], default="grpc")
+       if args.mode == "runpod":
+           import runpod
+           runpod.serverless.start({"handler": handler})
    ```
 
 2. **Request Format** (RunPod event dict):
@@ -285,7 +335,7 @@ TCP Layer:          Port 443 (HTTPS)
 
 ### Network Flow Comparison
 
-#### gRPC Flow (Client → Server, if server existed)
+#### gRPC Flow (Client → Server, fully implemented)
 
 ```
 CLIENT                                    SERVER
@@ -376,15 +426,16 @@ CLIENT                                    SERVER (RunPod)
 ### When Each Protocol is Used
 
 **Current Codebase**:
-- **gRPC**: Only in client (`Client._call_server()`), but **no server to connect to**
-- **HTTP**: Only in server (`handler()`), but **no client to call it**
+- **gRPC**: ✅ Fully functional - Client (`Client._call_server()`) + Server (`TensorInferenceServicer` + `serve_grpc()`)
+- **HTTP**: ⚠️ Partial - Server (`handler()`) exists, but **no HTTP client** implementation
 
-**Intended Usage** (per README):
-- **gRPC**: Traditional always-on deployment (client + server both gRPC)
-- **HTTP**: RunPod serverless deployment (client + server both HTTP)
+**Intended Usage**:
+- **gRPC**: Traditional always-on deployment (client + server both gRPC) ✅ **Works**
+- **HTTP**: RunPod serverless deployment (client + server both HTTP) ⚠️ **Server ready, client missing**
 
 **Actual Usage**:
-- **Neither works end-to-end** without implementing the missing pieces
+- ✅ **gRPC works end-to-end**: `python -m infemeral.server --mode grpc` then connect client
+- ❌ **HTTP incomplete**: Server ready for RunPod, but client needs HTTP implementation
 
 ---
 
@@ -550,20 +601,35 @@ The network layer is **only used once per token generation** - to send cloaked e
 
 **Client Network Call** (`infemeral/client.py`):
 ```python
-# Line 139-171: Client._call_server()
+# Line 205-243: Client._call_server()
 def _call_server(self, cloaked: torch.Tensor) -> torch.Tensor:
     # ... serialize, encrypt ...
     
     # ⚡ NETWORK CALL HAPPENS HERE ⚡
-    response = self.stub.Infer(request)  # gRPC call (line 160)
+    response = self.stub.Infer(request)  # gRPC call (line 226)
     # OR: response = requests.post(url, json=payload)  # HTTP (not implemented)
     
     # ... decrypt, deserialize ...
 ```
 
-**Server Network Handler** (`infemeral/server.py`):
+**Server Network Handlers** (`infemeral/server.py`):
+
+**gRPC Handler**:
 ```python
-# Line 478-578: handler() function
+# Line 477-543: TensorInferenceServicer.Infer()
+def Infer(self, request, context):
+    # ⚡ NETWORK REQUEST RECEIVED HERE ⚡
+    # (gRPC calls this method)
+    
+    # ... decrypt, process, encrypt ...
+    
+    # ⚡ NETWORK RESPONSE SENT HERE ⚡
+    return tensor_service_pb2.InferenceResponse(...)
+```
+
+**HTTP/RunPod Handler**:
+```python
+# Line 607-702: handler() function
 def handler(event: dict) -> dict:
     # ⚡ NETWORK REQUEST RECEIVED HERE ⚡
     # (RunPod calls this function via HTTP)
@@ -700,6 +766,23 @@ class Client:
 ```
 
 **Ciphertext Structure** (after decryption):
+
+**V2 Format** (current, preferred):
+```
+[1 byte: version (0x02)]
+[4 bytes: num_layers (uint32)]
+For each layer:
+    [4 bytes: key_data_length (uint32)]
+    [4 bytes: num_dimensions (uint32)]
+    [8 bytes × ndim: key_shape (int64 each)]
+    [key_data_length bytes: key tensor data (float16)]
+    [4 bytes: value_data_length (uint32)]
+    [4 bytes: num_dimensions (uint32)]
+    [8 bytes × ndim: value_shape (int64 each)]
+    [value_data_length bytes: value tensor data (float16)]
+```
+
+**V1 Format** (legacy, auto-detected):
 ```
 [4 bytes: key_data_length (uint32)]
 [4 bytes: num_dimensions (uint32)]
@@ -708,21 +791,30 @@ class Client:
 [key_data_length bytes: value tensor data (float16)]
 ```
 
+**Version Detection**: `unpack_kv_cache()` auto-detects format by checking first byte (0x02 = v2, else v1)
+
 **Encryption**: AES-256-GCM
 - Key: Session-specific (32 bytes)
 - Nonce: Random 12 bytes per write
 - Authentication: Built-in GCM tag
 
 **Operations**:
-- `save_kv_cache(session_id, keys, values, session_key)`: Encrypt and write
-- `load_kv_cache(session_id, session_key, device)`: Read, decrypt, unpack
+- `save_kv_cache(session_id, kv_tuples, session_key)`: Encrypt and write (uses v2 format)
+- `load_kv_cache(session_id, session_key, device)`: Read, decrypt, unpack (auto-detects v1/v2)
 - `delete_kv_cache(session_id)`: Unlink file
+- `cleanup_old_sessions(max_age_seconds)`: Delete KV cache files older than threshold (default: 1 hour)
+
+**Current Features**:
+- ✅ **Context Windowing**: `apply_context_windowing()` implements attention sink + sliding window (line 298)
+  - Keeps first `attention_sink_tokens` (default: 4) + last `max_context_length - sink_tokens` tokens
+  - Applied automatically when KV cache exceeds `max_context_length` (default: 2048)
+- ✅ **Session Cleanup**: `cleanup_old_sessions()` removes old cache files (called on server startup)
+- ✅ **Version Support**: Backward compatible with v1 format, uses v2 format for new caches
 
 **Current Limitations**:
-- No TTL/expiration (files persist indefinitely)
-- No LRU eviction
+- No LRU eviction (only age-based cleanup)
 - No Redis integration (despite README architecture diagram)
-- TODO: Implement tide-windowing for context > 2048 tokens
+- V1 format caches are ignored (will rebuild) - see `load_kv_cache()` line 161-163
 
 ### Model Weights Storage
 
@@ -853,17 +945,68 @@ class Client:
 - `INFEMERAL_CLIENT_MODEL_ID`: HuggingFace model ID for tokenizer
 
 **Server** (`INFEMERAL_SERVER_*`):
-- `INFEMERAL_SERVER_TENSORIZED_WEIGHTS_PATH`: Tensorizer weights path
-- `INFEMERAL_SERVER_WEIGHTS_PATH`: SafeTensors fallback path
-- `INFEMERAL_SERVER_MODEL_ID`: Model ID for config/architecture
+- `INFEMERAL_SERVER_TENSORIZED_WEIGHTS_PATH`: Tensorizer weights path (default: `/workspace/weights/model.tensors`)
+- `INFEMERAL_SERVER_WEIGHTS_DIR`: Model directory path (default: `/workspace/weights/model`)
+- `INFEMERAL_SERVER_MODEL_ID`: Model ID for config/architecture (default: `hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4`)
 - `INFEMERAL_SERVER_KV_CACHE_DIR`: KV cache directory (default: `/workspace/weights/kv`)
 - `INFEMERAL_SERVER_MAX_CONTEXT_LENGTH`: Max context (default: 2048)
+- `INFEMERAL_SERVER_ATTENTION_SINK_TOKENS`: Attention sink tokens (default: 4)
 - `INFEMERAL_SERVER_GRPC_PORT`: gRPC port (default: 50051)
 
 **Crypto** (`INFEMERAL_CRYPTO_*`):
 - `INFEMERAL_CRYPTO_HIDDEN_DIM`: Model hidden dimension (default: 4096)
 - `INFEMERAL_CRYPTO_DP_EPSILON`: DP epsilon (default: 2.0)
 - `INFEMERAL_CRYPTO_DP_DELTA`: DP delta (default: 1e-5)
+
+---
+
+## Supported Models
+
+### Llama 3.1 8B (Default)
+- **Model ID**: `hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4`
+- **Quantization**: AWQ INT4
+- **Hidden Dim**: 4096
+- **Layers**: 32
+- **Architecture**: Llama-style
+
+### DeepSeek-R1-32B (Optional)
+- **Model ID**: `dwetzel/DeepSeek-R1-Distill-Qwen-32B-GPTQ-INT4`
+- **Quantization**: GPTQ INT4
+- **Hidden Dim**: 5120
+- **Layers**: 64
+- **Context**: 32K tokens (4K on RTX 4090)
+- **Architecture**: Qwen-style
+
+#### Switching Models
+
+Set environment variables to use DeepSeek:
+```bash
+export INFEMERAL_SERVER_MODEL_PRESET=deepseek-r1-32b-gptq
+export INFEMERAL_SERVER_WEIGHTS_DIR=/workspace/weights/deepseek-r1-32b
+export INFEMERAL_SERVER_MAX_CONTEXT_LENGTH=4096  # Required for RTX 4090
+export INFEMERAL_CLIENT_WEIGHTS_PATH=/workspace/weights/deepseek-r1-32b-client/client_weights.safetensors
+export INFEMERAL_CLIENT_MODEL_ID=dwetzel/DeepSeek-R1-Distill-Qwen-32B-GPTQ-INT4
+```
+
+#### DeepSeek Setup
+
+1. Download model:
+```bash
+./scripts/download_deepseek_r1.sh
+```
+
+2. Extract client weights:
+```bash
+python -m infemeral.model_prep \
+    --model-id "dwetzel/DeepSeek-R1-Distill-Qwen-32B-GPTQ-INT4" \
+    --output-dir /workspace/weights/deepseek-r1-32b-client \
+    --client-only
+```
+
+3. NVIB auto-detects the 5120 dimension. To explicitly set:
+```bash
+export INFEMERAL_NVIB_DIM=5120
+```
 
 ---
 
@@ -920,39 +1063,40 @@ class Client:
 
 ### Missing Implementations
 
-1. **gRPC Server**: No actual server implementation (only handler exists)
-2. **RSA Key Wrapping**: Session keys sent plaintext
-3. **TLS**: gRPC uses insecure channel
-4. **KV Cache Conversion**: `past_key_values` format conversion incomplete
-5. **Tide-Windowing**: Context compression for >2048 tokens not implemented
-6. **Redis Integration**: README mentions Redis, but code uses filesystem
+1. **HTTP Client**: No HTTP client implementation for RunPod serverless (client only supports gRPC)
+2. **RSA Key Wrapping**: Session keys sent plaintext (TODO: RSA-OAEP wrapping)
+3. **TLS**: gRPC uses insecure channel (TODO: TLS support)
+4. **Redis Integration**: README mentions Redis, but code uses filesystem
 
 ### Known Issues
 
 1. **AWQ Rotary Embeddings**: Dimension mismatches handled with workarounds
-2. **KV Cache Loading**: Returns None but doesn't convert to `past_key_values` format
+2. **KV Cache V1 Format**: V1 format caches are ignored (returns None) - will rebuild automatically
 3. **Error Handling**: Basic, could be more robust
-4. **Session Management**: No cleanup/expiration for KV cache files
+4. **Session Management**: Age-based cleanup exists (`cleanup_old_sessions()`), but no LRU eviction
 
 ---
 
 ## Deployment Modes
 
-### 1. RunPod Serverless (Current)
+### 1. RunPod Serverless (HTTP)
 
-- **Entry**: `handler()` function
+- **Entry**: `handler()` function (line 607)
 - **Transport**: HTTP (via RunPod)
 - **Scaling**: Automatic (serverless)
 - **Cost**: Pay-per-request
 - **Cold Start**: Model loading on first request (~30-60s)
+- **Startup**: `python -m infemeral.server --mode runpod`
 
-### 2. Traditional gRPC (Planned)
+### 2. Traditional gRPC (Standalone Server)
 
-- **Entry**: Would need `TensorInferenceServicer` implementation
-- **Transport**: gRPC (port 50051)
+- **Entry**: `TensorInferenceServicer` class (line 470) + `serve_grpc()` function (line 546)
+- **Transport**: gRPC (port 50051, configurable)
 - **Scaling**: Manual (horizontal scaling)
 - **Cost**: Always-on pricing
 - **Cold Start**: None (model stays loaded)
+- **Startup**: `python -m infemeral.server --mode grpc [--port PORT] [--workers N]`
+- **Graceful Shutdown**: Handles SIGTERM/SIGINT signals
 
 ---
 
@@ -981,8 +1125,10 @@ tensor_service.proto       # gRPC service definition
 1. **Splits computation**: Client handles embeddings, server handles transformer layers
 2. **Uses cloaking**: Orthogonal rotation + DP noise prevents server from seeing raw data
 3. **Encrypts everything**: AES-256-GCM for transport and KV cache storage
-4. **Supports two modes**: RunPod serverless (HTTP, implemented) and gRPC (planned)
-5. **Stores state**: Encrypted KV cache on filesystem (not Redis)
+4. **Supports two server modes**: RunPod serverless (HTTP) and standalone gRPC server (both implemented)
+5. **Stores state**: Encrypted KV cache on filesystem (not Redis) with v2 format and context windowing
 6. **Processes**: Client does tokenization/embedding/sampling, server does transformer inference
 
-The system is **functional for RunPod serverless deployment** but **missing the gRPC server implementation** for traditional deployments.
+**Current Status**:
+- ✅ **gRPC**: Fully functional end-to-end (client + server)
+- ⚠️ **HTTP**: Server ready for RunPod, but client only supports gRPC (HTTP client missing)

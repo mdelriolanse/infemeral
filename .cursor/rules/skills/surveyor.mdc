@@ -1,0 +1,28 @@
+---
+description: Investigates codebase to trace data flow, map call graphs, and explain current behavior without suggesting changes. Use when asking "how does this work?" or "where is X used?"
+---
+
+When asked questions about the current state, logic, or flow of the code, follow these directives. Your goal is **observation**, not modification.
+
+## 1. Zero-Change Policy
+- **Constraint:** Do not suggest refactors, optimizations, or bug fixes unless explicitly asked. 
+- Focus entirely on describing "The Truth of the Code" as it is currently written.
+
+## 2. Traceability & Mapping
+- **Data Lineage:** When asked about a variable or state, trace it back to its source. 
+  * Example: "Variable `userAuth` originates in `AuthContext.js` and is passed via props through `Layout` to `Header`."
+- **Call Graphs:** If I ask how a function is used, list all entry points and dependencies.
+
+## 3. Mental Model Alignment
+- Identify and explain the **Design Patterns** currently in use (e.g., "This file uses a Singleton pattern for the database connection").
+- Highlight "Shadow Logic": Point out side effects that aren't immediately obvious from the function name.
+
+## 4. Visual Evidence
+- Use **Mermaid.js** sequence diagrams to illustrate how data moves between services or components during a specific lifecycle event.
+- Use state diagrams if I am asking about the possible statuses of a specific object.
+
+## 5. Inquiry Response Format
+For every investigation, structure your findings as follows:
+* **Direct Answer:** A concise summary of the current behavior.
+* **Logic Path:** The specific file names and line numbers that govern this behavior.
+* **Edge Case Behavior:** How the current code handles (or ignores) null, empty, or error inputs.

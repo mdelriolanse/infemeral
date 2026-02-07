@@ -1,0 +1,110 @@
+---
+description: Overview of Cursor configuration - agents, commands, and skills
+alwaysApply: true
+---
+
+# Cursor Configuration
+
+This project uses Cursor configuration files (in `.cursor/`) that define agents, commands, skills, and output styles. All configurations are self-contained within the `.cursor/` directory and function independently.
+
+## Agents
+
+The `.cursor/rules/agents/` directory contains agent definitions that should be used as Cursor agents:
+
+- **Location**: `.cursor/rules/agents/*.mdc`
+- **Format**: Markdown files with YAML frontmatter containing:
+  - `name`: Agent identifier
+  - `description`: When to use this agent (delegation criteria)
+  - `tools`: Available tools for the agent
+  - `model`: Model preference (haiku/sonnet/opus)
+  - `color`: UI color identifier
+
+**Usage**: When a task matches an agent's description, you should follow that agent's instructions and use its defined tools and approach. Read the agent file from `.cursor/rules/agents/` and apply its system prompt and workflow.
+
+**Available Agents**:
+- `performance-bottleneck-analyzer.mdc` - Performance analysis and optimization
+- `meta-agent.mdc` - Creates new agent configurations
+- `brainstormer.mdc` - Brainstorming and ideation
+- `commit-architect.mdc` - Commit message and git workflow
+- `spec-sync.mdc` - Specification synchronization
+- `test-architect.mdc` - Test planning and architecture
+
+## Commands
+
+The `.cursor/rules/commands/` directory contains slash command definitions that should be treated as Cursor commands:
+
+- **Location**: `.cursor/rules/commands/*.mdc`
+- **Format**: Markdown files with YAML frontmatter containing:
+  - `description`: What the command does
+  - `argument-hint`: Expected arguments
+  - `allowed-tools`: Tools the command can use
+
+**Usage**: When a user invokes a command (e.g., `/plan`, `/prime`, `/build`), read the corresponding command file from `.cursor/rules/commands/` and follow its workflow exactly. These commands define structured workflows for common tasks.
+
+**Available Commands**:
+- `/prime` - Initialize agent understanding of codebase
+- `/plan [requirement]` - Generate detailed implementation plan
+- `/build [feature]` - Implement a feature following project patterns
+- `/document-issue [issue-name]` - Document issues with fixes and exploration
+- `/write-tests` - Generate test suites
+- `/write-commits` - Generate commit messages
+- `/load-docs [url]` - Scrape documentation
+- `/network-audit [url]` - Analyze page weight and API health
+- `/ui-regress [local] [prod]` - Visual diff between environments
+- `/parallel-audit [dir]` - Security and performance audits
+- `/update-context-bundles [scope]` - Refresh JSON context bundles
+- `/build-context-bundles` - Build context bundles
+- `/ingest-context-bundles` - Ingest context bundles
+- `/question [question]` - Answer questions about codebase without coding
+- `/output-styles [style-name]` - Switch output styles or list available styles
+
+## Output Styles
+
+The `.cursor/output-styles/` directory contains output style definitions:
+
+- **Location**: `.cursor/output-styles/*.md`
+- **Format**: Markdown files with YAML frontmatter containing:
+  - `name`: Style display name
+  - `description`: What the style does
+- **State File**: `.cursor/.current-output-style` stores the currently active style
+
+**Usage**: Use `/output-styles --list` to see all available styles, or `/output-styles bullets` to switch styles. The selected style persists until changed.
+
+## Configuration
+
+The `.cursor/` directory is self-contained and independent. All paths reference `.cursor/` directories, not `.claude/`.
+
+## Skills
+
+The `.cursor/rules/skills/` directory contains skill definitions that enhance agent capabilities:
+
+- **Location**: `.cursor/rules/skills/*/SKILL.md` (note: some may be `.mdc`)
+- **Usage**: These skills provide specialized domain knowledge and should be read and applied when relevant to the task
+
+**Available Skills**:
+- `architect/` - System design and architecture
+- `debugger/` - Structured debugging workflows
+- `explainer/` - Code explanation and teaching
+- `ponderer/` - Step-by-step reasoning
+- `surveyor/` - Codebase investigation
+
+## Implementation Guidelines
+
+1. **Agent Delegation**: When a task matches an agent's description, read the agent file from `.cursor/rules/agents/` and follow its instructions
+2. **Command Execution**: When a command is invoked, read the command file from `.cursor/rules/commands/` and execute its workflow
+3. **Output Style Application**: Check `.cursor/.current-output-style` at the start of each response and apply the style from `.cursor/output-styles/`
+4. **Skill Application**: When a skill is relevant, read and apply its guidelines from `.cursor/rules/skills/`
+5. **File Reading**: Always read the actual files from `.cursor/` directories rather than assuming their contents
+6. **Independence**: This configuration is completely independent of `.claude/` - all references use `.cursor/` paths
+
+## Example Workflow
+
+If a user says `/plan add user authentication`:
+
+1. Read `.cursor/rules/commands/plan.mdc` to understand the command workflow
+2. Follow the structured steps defined in that file
+3. Use any referenced agents (e.g., if the plan mentions performance concerns, use `performance-bottleneck-analyzer`)
+4. Check `.cursor/.current-output-style` and apply the appropriate formatting
+5. Output the plan according to the command's specified format and current output style
+
+All configurations in `.cursor/` are self-contained and function independently.

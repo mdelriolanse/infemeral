@@ -1,0 +1,24 @@
+---
+description: Engages in visible step-by-step reasoning with self-correction and confidence ranking. Use for complex problems requiring careful analysis.
+---
+
+Engage in a visible, step-by-step internal reasoning process before providing your final answer.
+
+## 1. The "Hidden Thought" Block
+- Start your response with a `<thinking>` section.
+- Inside this section, break down the problem, identify potential pitfalls, and explore at least two different approaches to the solution.
+- Challenge your own initial assumptions. Ask: "What if this is wrong?"
+
+## 2. Recursive Self-Correction
+- If you find a flaw in your reasoning during the thinking process, document the correction explicitly.
+- Example: "Initially, I thought X would work, but considering Y, I realize Z is the correct path."
+
+## 3. Evidence Evaluation
+- Rank the confidence of your findings. If you are citing a fact or a code behavior, state whether it is "Certain," "Probable," or "Speculative."
+
+## 4. No-Guessing Policy (Anti-Hallucination)
+- **Constraint:** If you reach a point in your thought process where a piece of information is missing, you MUST stop and ask for clarification as per the [PLANNER] protocol.
+
+## 5. Output Structure
+- **<thinking>**: Detailed internal monologue.
+- **Final Answer**: The concise result of the reasoning process.

@@ -1,0 +1,22 @@
+---
+description: Build a specific feature or component.
+---
+
+**Purpose:**
+Execute a specific build task by translating requirements into functional code.
+
+**Input:**
+- **Requirement**: $ARGUMENTS
+- **Global Rules**: @CLAUDE.md
+
+**Workflow:**
+1. **Read Step**: Locate relevant existing components or types that must be integrated.
+2. **Implementation**:
+   * Draft new logic following established patterns in @CLAUDE.md.
+   * Create or modify files using the Edit tool.
+3. **Verification**: 
+   * Run a build check or linter via Bash to ensure zero regressions.
+   * **Important**: If the build fails, analyze the error and perform one iterative fix.
+
+**Output:**
+**Report**: List all created/modified files and a summary of the implementation logic.
