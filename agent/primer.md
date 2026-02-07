@@ -396,6 +396,70 @@ client.close()
 
 ---
 
+## Active RunPod Configuration (2026-02-07)
+
+**Pod Specs**: 1x L40S (48 GB VRAM), 94 GB RAM, 16 vCPU
+- **IP**: 203.57.40.185
+- **Port**: 10105
+- **SSH**: `ssh -p 10105 root@203.57.40.185`
+
+**Current Setup**:
+- Virtual environment: `/mnt/.venv` (managed with `uv`)
+- Source code: `/workspace/infemeral-src` (synced via git)
+- Weights: `/workspace/weights/`
+  - Client: `client_weights.safetensors` (2.1GB)
+  - Server (Llama): `model/` (5.4GB)
+  - Server (DeepSeek): `deepseek-r1-32b/` (18GB)
+  - Tokenizer: `tokenizer/` (19MB)
+  - KV cache: `kv/` (persistent storage)
+
+**Package Versions (Critical)**:
+- Python: 3.11.10
+- PyTorch: 2.9.1+cu128
+- Transformers: 4.51.3 (pinned - newer versions break AutoAWQ)
+- AutoAWQ: 0.2.7.post3 (pinned for compatibility)
+
+**Server Management**:
+```bash
+# Start server
+ssh -p 10105 root@203.57.40.185 "cd /workspace/infemeral-src && nohup /mnt/.venv/bin/python -m infemeral.server > /tmp/server.log 2>&1 &"
+
+# Check logs
+ssh -p 10105 root@203.57.40.185 "tail -50 /tmp/server.log"
+
+# Kill server
+ssh -p 10105 root@203.57.40.185 "pkill -f 'python -m infemeral.server'"
+
+# Check GPU
+ssh -p 10105 root@203.57.40.185 "nvidia-smi"
+
+# Sync code
+cd /home/mdelr/apps/infemeral
+git add -A && git commit -m "..." && git push origin main
+ssh -p 10105 root@203.57.40.185 "cd /workspace/infemeral-src && git pull origin main"
+```
+
+**Model Configuration (L40S)**:
+
+For **Llama 3.1 8B AWQ** (current setup):
+- VRAM usage: ~6GB
+- Max context: 2048 tokens (can increase to 4096+)
+- Headroom: 42GB available for KV cache and activations
+- Status: ✅ Running smoothly
+
+For **DeepSeek-R1-32B GPTQ** (available):
+- VRAM usage: ~17GB
+- Max context: Up to 16K tokens (vs 4K limit on RTX 4090)
+- Headroom: 31GB for KV cache
+- Status: ⚠️ Not tested yet on L40S
+
+**To switch to DeepSeek-R1-32B**:
+```bash
+export INFEMERAL_SERVER_MODEL_PRESET=deepseek-r1-32b-gptq
+export INFEMERAL_SERVER_WEIGHTS_DIR=/workspace/weights/deepseek-r1-32b
+export INFEMERAL_SERVER_MAX_CONTEXT_LENGTH=8192
+```
+
 ## Current Development Notes
 
 **Recent Work (2026-01 to 2026-02)**:
